@@ -1,24 +1,24 @@
 """ContextEngine CLI - Interactive interface for demo and testing.
 
 Usage:
-    python cli.py                    # Interactive mode (ContextEngine agent)
-    python cli.py --baseline         # Use baseline agent
-    python cli.py --compare          # Run same question on both agents
-    python cli.py --question "..."   # Single question mode
+    python cli.py                          # Interactive mode (ContextEngine pipeline agent)
+    python cli.py --agent contexthub_react # LLM-driven ContextEngine agent
+    python cli.py --baseline               # Use baseline agent (same as --agent baseline)
+    python cli.py --compare                # Run every question on all three agents
+    python cli.py --question "..."         # Single question mode
 """
-
-import json
-import sys
-import time
 
 import click
 from rich.console import Console
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
-from rich.tree import Tree
+
+from app.agent.registry import AGENT_DESCRIPTIONS, AGENT_LABELS, get_agent
 
 console = Console()
+
+COLORS = {"contexthub": "green", "contexthub_react": "magenta", "baseline": "blue"}
+COMPARE_ORDER = ["baseline", "contexthub_react", "contexthub"]
 
 
 def format_tool_calls(tool_calls: list[dict]) -> str:
@@ -37,72 +37,68 @@ def format_tool_calls(tool_calls: list[dict]) -> str:
 
 def display_response(response: dict, show_trace: bool = True) -> None:
     """Display an agent response with formatting."""
-    agent_name = response.get("agent", "unknown").upper()
-    answer = response.get("answer", "No answer generated")
+    agent = response.get("agent", "unknown")
+    color = COLORS.get(agent, "white")
+    console.print(f"\n[bold {color}]--- {AGENT_LABELS.get(agent, agent)} ---[/bold {color}]")
+
     tool_calls = response.get("tool_calls", [])
-    latency = response.get("latency_seconds", 0)
-    sources = response.get("sources", [])
-
-    # Header
-    color = "green" if agent_name == "CONTEXTHUB" else "blue"
-    console.print(f"\n[bold {color}]━━━ {agent_name} Agent ━━━[/bold {color}]")
-
-    # Trace
     if show_trace and tool_calls:
         console.print(f"\n[dim]Tool Calls ({len(tool_calls)}):[/dim]")
-        console.print(f"[dim]{format_tool_calls(tool_calls)}[/dim]")
+        # markup=False: SQL like "[...]" must not be parsed as Rich markup
+        console.print(format_tool_calls(tool_calls), style="dim", markup=False, highlight=False)
 
-    # Answer
-    console.print(f"\n[bold]Answer:[/bold]")
-    console.print(Panel(answer, border_style=color))
+    console.print("\n[bold]Answer:[/bold]")
+    console.print(Panel(response.get("answer", "No answer generated"), border_style=color))
 
-    # Sources
+    sources = response.get("sources", [])
     if sources:
         console.print("[dim]Sources:[/dim]")
         for src in sources:
             if src.get("type") == "definition":
-                console.print(f"  [dim]• {src['metric']} ({src['status']}) → {src['source']}[/dim]")
+                console.print(f"  [dim]- {src['metric']} ({src['status']}) -> {src['source']}[/dim]")
             elif src.get("type") == "trust_signal":
-                console.print(f"  [dim]• {src['asset']}: {src['level']}[/dim]")
+                console.print(f"  [dim]- {src['asset']}: {src['level']}[/dim]")
 
-    # Latency
-    console.print(f"\n[dim]Latency: {latency:.1f}s | Tools used: {len(tool_calls)}[/dim]")
+    console.print(f"\n[dim]Latency: {response.get('latency_seconds', 0):.1f}s | "
+                  f"Tools used: {len(tool_calls)}[/dim]")
 
 
-def display_comparison(baseline_response: dict, contexthub_response: dict) -> None:
-    """Display side-by-side comparison."""
-    console.print("\n[bold]━━━ COMPARISON ━━━[/bold]\n")
+def display_comparison(responses: list[dict]) -> None:
+    """Display a side-by-side comparison of several agents' responses."""
+    console.print("\n[bold]--- COMPARISON ---[/bold]\n")
 
     table = Table(show_header=True, header_style="bold")
     table.add_column("Aspect", style="dim")
-    table.add_column("Baseline", style="blue")
-    table.add_column("ContextEngine", style="green")
+    for r in responses:
+        agent = r.get("agent", "?")
+        table.add_column(AGENT_LABELS.get(agent, agent), style=COLORS.get(agent, "white"))
 
-    table.add_row(
-        "Tool Calls",
-        str(len(baseline_response.get("tool_calls", []))),
-        str(len(contexthub_response.get("tool_calls", []))),
-    )
-    table.add_row(
-        "Latency",
-        f"{baseline_response.get('latency_seconds', 0):.1f}s",
-        f"{contexthub_response.get('latency_seconds', 0):.1f}s",
-    )
-    table.add_row(
-        "Sources Cited",
-        str(len(baseline_response.get("sources", []))),
-        str(len(contexthub_response.get("sources", []))),
-    )
-
+    table.add_row("Tool Calls", *[str(len(r.get("tool_calls", []))) for r in responses])
+    table.add_row("Latency", *[f"{r.get('latency_seconds', 0):.1f}s" for r in responses])
+    table.add_row("Sources Cited", *[str(len(r.get("sources", []))) for r in responses])
+    table.add_row("Succeeded", *["yes" if r.get("success") else "no" for r in responses])
     console.print(table)
 
 
+def run_question(question: str, agent_names: list[str], show_trace: bool) -> None:
+    responses = []
+    for name in agent_names:
+        with console.status(f"[bold]{AGENT_LABELS[name]} thinking..."):
+            response = get_agent(name).ask(question)
+        display_response(response, show_trace=show_trace)
+        responses.append(response)
+    if len(responses) > 1:
+        display_comparison(responses)
+
+
 @click.command()
-@click.option("--baseline", is_flag=True, help="Use baseline agent (schema-only)")
-@click.option("--compare", is_flag=True, help="Run both agents and compare")
+@click.option("--agent", "agent_name", type=click.Choice(list(AGENT_DESCRIPTIONS)), default="contexthub",
+              help="Agent to use")
+@click.option("--baseline", is_flag=True, help="Shortcut for --agent baseline")
+@click.option("--compare", is_flag=True, help="Run all three agents and compare")
 @click.option("--question", "-q", type=str, help="Single question (non-interactive)")
 @click.option("--no-trace", is_flag=True, help="Hide tool call traces")
-def main(baseline: bool, compare: bool, question: str, no_trace: bool):
+def main(agent_name: str, baseline: bool, compare: bool, question: str, no_trace: bool):
     """ContextEngine CLI - AI Context Layer for Enterprise Data."""
 
     console.print(Panel.fit(
@@ -112,39 +108,18 @@ def main(baseline: bool, compare: bool, question: str, no_trace: bool):
     ))
 
     if baseline:
-        from app.agent.baseline import BaselineAgent
-        agent = BaselineAgent()
-        agent_label = "Baseline"
-    else:
-        from app.agent.contexthub import ContextEngineAgent
-        agent = ContextEngineAgent()
-        agent_label = "ContextEngine"
-
-    if compare:
-        from app.agent.baseline import BaselineAgent
-        from app.agent.contexthub import ContextEngineAgent
-        baseline_agent = BaselineAgent()
-        contexthub_agent = ContextEngineAgent()
-
-    console.print(f"\n[dim]Agent: {agent_label} | Type 'quit' to exit | Type 'trace' to toggle traces[/dim]\n")
-
+        agent_name = "baseline"
+    agent_names = COMPARE_ORDER if compare else [agent_name]
     show_trace = not no_trace
 
-    # Single question mode
+    label = "all agents" if compare else AGENT_LABELS[agent_name]
+    console.print(f"\n[dim]Agent: {label} | Type 'quit' to exit | 'trace' toggles traces | 'help'[/dim]\n")
+
     if question:
-        if compare:
-            console.print(f"\n[bold]Question:[/bold] {question}\n")
-            b_response = baseline_agent.ask(question)
-            display_response(b_response, show_trace=show_trace)
-            c_response = contexthub_agent.ask(question)
-            display_response(c_response, show_trace=show_trace)
-            display_comparison(b_response, c_response)
-        else:
-            response = agent.ask(question)
-            display_response(response, show_trace=show_trace)
+        console.print(f"\n[bold]Question:[/bold] {question}")
+        run_question(question, agent_names, show_trace)
         return
 
-    # Interactive mode
     while True:
         try:
             user_input = console.input("\n[bold green]>[/bold green] ").strip()
@@ -160,27 +135,14 @@ def main(baseline: bool, compare: bool, question: str, no_trace: bool):
                 continue
             if user_input.lower() == "help":
                 console.print("[dim]Commands: quit, trace, help[/dim]")
-                console.print("[dim]Ask any question about the enterprise data.[/dim]")
                 console.print("[dim]Examples:[/dim]")
-                console.print("[dim]  What was our revenue in July?[/dim]")
+                console.print("[dim]  What was our revenue in July 2026?[/dim]")
                 console.print("[dim]  Which metric should I use for revenue?[/dim]")
                 console.print("[dim]  How many active customers do we have?[/dim]")
+                console.print("[dim]  What was revenue by product category in July 2026?[/dim]")
                 continue
 
-            if compare:
-                console.print(f"\n[bold]Question:[/bold] {user_input}")
-                with console.status("[bold]Baseline thinking..."):
-                    b_response = baseline_agent.ask(user_input)
-                display_response(b_response, show_trace=show_trace)
-
-                with console.status("[bold]ContextEngine thinking..."):
-                    c_response = contexthub_agent.ask(user_input)
-                display_response(c_response, show_trace=show_trace)
-                display_comparison(b_response, c_response)
-            else:
-                with console.status(f"[bold]{agent_label} thinking..."):
-                    response = agent.ask(user_input)
-                display_response(response, show_trace=show_trace)
+            run_question(user_input, agent_names, show_trace)
 
         except KeyboardInterrupt:
             console.print("\n[dim]Goodbye![/dim]")

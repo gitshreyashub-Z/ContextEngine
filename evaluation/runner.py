@@ -63,16 +63,8 @@ Executor = Callable[[str], dict]
 
 
 def make_agent(name: str):
-    if name == "baseline":
-        from app.agent.baseline import BaselineAgent
-        return BaselineAgent()
-    if name == "contexthub":
-        from app.agent.contexthub import ContextEngineAgent
-        return ContextEngineAgent()
-    if name == "contexthub_react":
-        from app.agent.contexthub_react import ContextEngineReActAgent
-        return ContextEngineReActAgent()
-    raise ValueError(f"Unknown agent: {name}")
+    from app.agent.registry import get_agent
+    return get_agent(name)
 
 
 def load_dataset(limit: int | None = None) -> list[dict]:

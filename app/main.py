@@ -46,7 +46,8 @@ app.add_middleware(
 class AskRequest(BaseModel):
     """Request model for the /ask endpoint."""
     question: str = Field(..., description="Natural language question about the enterprise data")
-    agent: str = Field(default="contexthub", description="Agent to use: 'contexthub' or 'baseline'")
+    agent: str = Field(default="contexthub",
+                       description="Agent to use: 'contexthub' (pipeline), 'contexthub_react' or 'baseline'")
 
 
 class ToolCallInfo(BaseModel):
@@ -87,25 +88,22 @@ async def health_check():
 def ask_question(request: AskRequest):
     """Ask a question to the AI agent.
 
-    The ContextEngine agent will:
+    The ContextEngine agents will:
     1. Search for relevant assets
     2. Look up business definitions
     3. Check trust signals
     4. Generate and execute SQL
     5. Return a grounded answer with sources
     """
+    from app.agent.registry import AGENT_DESCRIPTIONS, get_agent
+
+    if request.agent not in AGENT_DESCRIPTIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown agent: {request.agent}. Use one of: {', '.join(AGENT_DESCRIPTIONS)}.",
+        )
     try:
-        if request.agent == "baseline":
-            from app.agent.baseline import BaselineAgent
-            agent = BaselineAgent()
-        elif request.agent == "contexthub":
-            from app.agent.contexthub import ContextEngineAgent
-            agent = ContextEngineAgent()
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown agent: {request.agent}. Use 'contexthub' or 'baseline'.",
-            )
+        agent = get_agent(request.agent)
 
         response = agent.ask(request.question)
 
@@ -132,6 +130,13 @@ def ask_question(request: AskRequest):
     except Exception as e:
         logger.error(f"Error processing question: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/agents")
+def list_agents():
+    """List the available agents."""
+    from app.agent.registry import AGENT_DESCRIPTIONS
+    return {"agents": AGENT_DESCRIPTIONS}
 
 
 @app.get("/metrics")

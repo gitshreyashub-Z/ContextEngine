@@ -14,11 +14,7 @@ from evaluation.runner import DIMENSIONS, overall  # noqa: E402
 
 RESULTS_DIR = Path(__file__).parent / "results"
 
-LABELS = {
-    "baseline": "Baseline",
-    "contexthub_react": "ContextEngine (ReAct)",
-    "contexthub": "ContextEngine (pipeline)",
-}
+from app.agent.registry import AGENT_LABELS as LABELS  # noqa: E402
 
 DIMENSION_NOTES = {
     "execution_accuracy": "Agent's SQL returns the gold result (numbers checked)",

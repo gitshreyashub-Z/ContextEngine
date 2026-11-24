@@ -582,7 +582,9 @@ Rules:
         def fmt(value: Any) -> str:
             if value is None:
                 return "no matching data"
-            if isinstance(value, (int, float)) or hasattr(value, "as_tuple"):
+            if isinstance(value, int) and not isinstance(value, bool):
+                return f"{value:,}"
+            if isinstance(value, float) or hasattr(value, "as_tuple"):
                 return f"{value:,.2f}"
             return str(value)
 
