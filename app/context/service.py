@@ -1,8 +1,9 @@
 """Context layer service - retrieval logic for business context."""
 
+import functools
 from typing import Any
 
-from sqlalchemy import or_, text
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.context.models import (
@@ -15,23 +16,37 @@ from app.context.models import (
 from app.db.connection import get_session
 
 
+def _read(method):
+    """Run a lookup in a short-lived session unless one was injected.
+
+    A single long-lived session shared by every request is not thread-safe (the API
+    serves requests from a threadpool) and kept an idle transaction open between calls.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if self._session is not None:
+            return method(self, self._session, *args, **kwargs)
+        session = get_session(readonly=True)
+        try:
+            return method(self, session, *args, **kwargs)
+        finally:
+            session.close()
+    return wrapper
+
+
 class ContextService:
     """Service for querying the structured business context layer."""
 
     def __init__(self, session: Session | None = None):
+        # An injected session (e.g. in tests) is reused; otherwise each call opens its own.
         self._session = session
 
-    @property
-    def session(self) -> Session:
-        if self._session is None:
-            self._session = get_session(readonly=True)
-        return self._session
-
-    def search_assets(self, query: str) -> list[dict[str, Any]]:
+    @_read
+    def search_assets(self, session: Session, query: str) -> list[dict[str, Any]]:
         """Search assets by name or description. Returns matching assets with metadata."""
         search_term = f"%{query.lower()}%"
         results = (
-            self.session.query(Asset)
+            session.query(Asset)
             .filter(
                 or_(
                     Asset.name.ilike(search_term),
@@ -53,11 +68,12 @@ class ContextService:
             for a in results
         ]
 
-    def get_definition(self, metric_name: str) -> dict[str, Any] | None:
+    @_read
+    def get_definition(self, session: Session, metric_name: str) -> dict[str, Any] | None:
         """Get the business definition for a metric."""
         # Try exact match first
         defn = (
-            self.session.query(BusinessDefinition)
+            session.query(BusinessDefinition)
             .filter(BusinessDefinition.metric_name == metric_name.lower().replace(" ", "_"))
             .first()
         )
@@ -66,7 +82,7 @@ class ContextService:
         if not defn:
             search_term = f"%{metric_name.lower()}%"
             defn = (
-                self.session.query(BusinessDefinition)
+                session.query(BusinessDefinition)
                 .filter(
                     or_(
                         BusinessDefinition.metric_name.ilike(search_term),
@@ -94,11 +110,12 @@ class ContextService:
             "notes": defn.notes,
         }
 
-    def search_definitions(self, query: str) -> list[dict[str, Any]]:
+    @_read
+    def search_definitions(self, session: Session, query: str) -> list[dict[str, Any]]:
         """Search all definitions matching a query. Returns multiple results."""
         search_term = f"%{query.lower()}%"
         results = (
-            self.session.query(BusinessDefinition)
+            session.query(BusinessDefinition)
             .filter(
                 or_(
                     BusinessDefinition.metric_name.ilike(search_term),
@@ -123,10 +140,11 @@ class ContextService:
             for d in results
         ]
 
-    def get_trust_signal(self, asset_name: str) -> dict[str, Any] | None:
+    @_read
+    def get_trust_signal(self, session: Session, asset_name: str) -> dict[str, Any] | None:
         """Get trust signal for an asset."""
         signal = (
-            self.session.query(TrustSignal)
+            session.query(TrustSignal)
             .filter(TrustSignal.asset_name == asset_name)
             .first()
         )
@@ -135,7 +153,7 @@ class ContextService:
             # Try fuzzy
             search_term = f"%{asset_name.lower()}%"
             signal = (
-                self.session.query(TrustSignal)
+                session.query(TrustSignal)
                 .filter(TrustSignal.asset_name.ilike(search_term))
                 .first()
             )
@@ -151,10 +169,11 @@ class ContextService:
             "last_validated": signal.last_validated.isoformat() if signal.last_validated else None,
         }
 
-    def get_schema(self, table_name: str) -> list[dict[str, Any]]:
+    @_read
+    def get_schema(self, session: Session, table_name: str) -> list[dict[str, Any]]:
         """Get enriched schema information for a table."""
         results = (
-            self.session.query(SchemaInfo)
+            session.query(SchemaInfo)
             .filter(SchemaInfo.table_name == table_name)
             .all()
         )
@@ -171,10 +190,11 @@ class ContextService:
             for s in results
         ]
 
-    def get_lineage(self, asset_name: str) -> list[dict[str, Any]]:
+    @_read
+    def get_lineage(self, session: Session, asset_name: str) -> list[dict[str, Any]]:
         """Get lineage relationships for an asset (both upstream and downstream)."""
         results = (
-            self.session.query(Lineage)
+            session.query(Lineage)
             .filter(
                 or_(
                     Lineage.source_asset == asset_name,
@@ -195,9 +215,10 @@ class ContextService:
             for l in results
         ]
 
-    def get_all_definitions(self) -> list[dict[str, Any]]:
+    @_read
+    def get_all_definitions(self, session: Session) -> list[dict[str, Any]]:
         """Get all business definitions (useful for listing available metrics)."""
-        results = self.session.query(BusinessDefinition).all()
+        results = session.query(BusinessDefinition).all()
         return [
             {
                 "metric_name": d.metric_name,
