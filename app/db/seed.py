@@ -303,7 +303,7 @@ def seed_business_data():
         update_customer_last_order_dates(session, customers, orders)
 
         session.commit()
-        print("\n✓ Business data seeded successfully!")
+        print("\n[OK] Business data seeded successfully!")
         print(f"  Products: {len(products)}")
         print(f"  Customers: {len(customers)}")
         print(f"  Orders: {len(orders)}")

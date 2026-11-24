@@ -108,7 +108,7 @@ def seed_business_definitions(session) -> None:
             filter_condition="status = 'completed'",
             owner="Finance Team",
             status=MetricStatus.CERTIFIED,
-            examples="Q: 'What was revenue last month?' → Use net_revenue. Q: 'Monthly revenue trend' → Use net_revenue grouped by month.",
+            examples="Q: 'What was revenue last month?' -> Use net_revenue. Q: 'Monthly revenue trend' -> Use net_revenue grouped by month.",
             notes="net_amount = total_amount - discount_amount - refund_amount + tax_amount. Only include completed orders.",
         ),
         BusinessDefinition(
@@ -147,7 +147,7 @@ def seed_business_definitions(session) -> None:
             filter_condition="is_active = true AND last_order_date >= CURRENT_DATE - INTERVAL '90 days'",
             owner="Customer Success Team",
             status=MetricStatus.CERTIFIED,
-            examples="Q: 'How many active customers?' → Use this definition, not just is_active flag.",
+            examples="Q: 'How many active customers?' -> Use this definition, not just is_active flag.",
             notes="The is_active flag alone is unreliable - it's not always updated when customers churn. The 90-day order recency check ensures accuracy.",
         ),
         BusinessDefinition(
@@ -160,7 +160,7 @@ def seed_business_definitions(session) -> None:
             filter_condition=None,
             owner="Customer Success Team",
             status=MetricStatus.CERTIFIED,
-            examples="Q: 'How many customers do we have total?' → Use this.",
+            examples="Q: 'How many customers do we have total?' -> Use this.",
             notes="Includes active and inactive customers.",
         ),
         BusinessDefinition(
@@ -173,7 +173,7 @@ def seed_business_definitions(session) -> None:
             filter_condition="status = 'completed'",
             owner="Finance Team",
             status=MetricStatus.CERTIFIED,
-            examples="Q: 'What is our AOV?' → Average of net_amount for completed orders.",
+            examples="Q: 'What is our AOV?' -> Average of net_amount for completed orders.",
             notes="Uses net_amount (not total_amount) to reflect actual revenue per order.",
         ),
         BusinessDefinition(
@@ -186,7 +186,7 @@ def seed_business_definitions(session) -> None:
             filter_condition="status != 'pending'",
             owner="Operations Team",
             status=MetricStatus.CERTIFIED,
-            examples="Q: 'What is our completion rate?' → Completed orders / (all orders - pending).",
+            examples="Q: 'What is our completion rate?' -> Completed orders / (all orders - pending).",
             notes="Excludes pending orders since they haven't been processed yet.",
         ),
         BusinessDefinition(
@@ -199,7 +199,7 @@ def seed_business_definitions(session) -> None:
             filter_condition="status IN ('completed', 'refunded')",
             owner="Finance Team",
             status=MetricStatus.CERTIFIED,
-            examples="Q: 'What's our refund rate?' → Refunded / (Completed + Refunded).",
+            examples="Q: 'What's our refund rate?' -> Refunded / (Completed + Refunded).",
             notes="Only considers orders that were fulfilled (completed or refunded), not cancelled or pending.",
         ),
         BusinessDefinition(
@@ -452,7 +452,7 @@ def seed_context_data():
         seed_lineage(session)
 
         session.commit()
-        print("\n✓ Context layer seeded successfully!")
+        print("\n[OK] Context layer seeded successfully!")
 
     except Exception as e:
         session.rollback()

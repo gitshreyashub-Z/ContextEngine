@@ -27,7 +27,7 @@ def main():
     seed_context_data()
 
     print("\n" + "=" * 50)
-    print("  ✓ All data seeded successfully!")
+    print("  [OK] All data seeded successfully!")
     print("=" * 50)
     print("\nYou can now run:")
     print("  python cli.py                    # Interactive mode")
