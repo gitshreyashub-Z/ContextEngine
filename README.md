@@ -18,6 +18,13 @@ Enterprise databases contain data, but not business meaning. A schema tells an L
 
 **Without this context, AI agents over enterprise data fail silently** — they produce confident answers using wrong metrics, deprecated columns, or incorrect filters. The failure mode is not a crash; it's a plausible-sounding wrong answer.
 
+How big is the error? On the seeded dataset (numbers vary slightly with the seed date):
+
+| Question | Naive SQL | Certified definition |
+|---|---|---|
+| Revenue in July 2026 | `SUM(total_amount)` → **₹4.11 Cr** | `SUM(net_amount) WHERE status='completed'` → **₹3.06 Cr** (naive is 35% too high) |
+| Active customers | `WHERE is_active` → **805** | `is_active AND last order within 90 days` → **274** |
+
 ---
 
 ## Hypothesis
@@ -29,83 +36,68 @@ Enterprise databases contain data, but not business meaning. A schema tells an L
 ## Architecture
 
 ```
-                         User Question
-                              │
-                              ▼
-                       ┌─────────────┐
-                       │  AI Agents  │
-                       │(2 variants) │
-                       └──────┬──────┘
-                              │
-                    Context tools (MCP)
-                              │
-                              ▼
-                  ┌───────────────────────┐
-                  │    Context Layer      │
-                  │                       │
-                  │  • Metadata           │
-                  │  • Business Defs      │
-                  │  • Trust Signals      │
-                  │  • Schema Info        │
-                  │  • Lineage            │
-                  └───────────┬───────────┘
-                              │
-                              ▼
-                       ┌─────────────┐
-                       │ PostgreSQL  │
-                       │ (business   │
-                       │   data)     │
-                       └──────┬──────┘
-                              │
-                              ▼
-                         SQL Result
-                              │
-                              ▼
-                      Grounded Answer
+                              User question
+                                    │
+          ┌─────────────────────────┼──────────────────────────┐
+          ▼                         ▼                          ▼
+   ┌─────────────┐        ┌──────────────────┐       ┌──────────────────┐
+   │  Baseline   │        │ ContextEngine    │       │ ContextEngine    │
+   │ (ReAct loop)│        │ ReAct (same loop)│       │ pipeline         │
+   │ execute_sql │        │ all 7 tools      │       │ fixed tool order │
+   └──────┬──────┘        └────────┬─────────┘       └────────┬─────────┘
+          │                        │                          │
+          │              ┌─────────▼──────────────────────────▼───┐
+          │              │  Context tools (ContextTools)          │ ◄── also served over
+          │              │  search_assets · get_definition ·      │     MCP (stdio) to any
+          │              │  get_trust_signal · get_schema ·       │     MCP client
+          │              │  get_lineage · list_metrics            │
+          │              └─────────┬──────────────────────────────┘
+          │                        │
+          ▼                        ▼
+   ┌────────────────────────────────────────────┐
+   │ execute_sql: validator → read-only DB role │
+   └──────────────────────┬─────────────────────┘
+                          ▼
+        PostgreSQL 16:  business.*  (data)   context.*  (definitions, trust,
+                                                         schema info, lineage)
 ```
 
-**Key principle:** The agent does not blindly query the database. It first consults the context layer to understand business meaning, then generates SQL based on certified definitions.
+**Key principle:** the context agents do not blindly query the database. They first consult the context layer to understand business meaning, then compute the metric from its certified definition.
 
 ---
 
-## How It Works
+## The three agents
 
-### Agent Workflow (ContextEngine)
+| Agent | How it works | Role in the experiment |
+|---|---|---|
+| `baseline` | LangGraph ReAct loop. The LLM sees table/column names in its system prompt and writes SQL with an `execute_sql` tool. | Control group |
+| `contexthub_react` | **Same** LangGraph loop, **same** LLM, **same** schema prompt — plus the six context tools and instructions on *how* to use them. The prompt never states the answers (no "use net_revenue", no 90-day rule). | Clean ablation: only context access differs from baseline |
+| `contexthub` | Deterministic pipeline: Python picks the metric (trust-ranked) and builds SQL from its definition; the LLM is called once to phrase the answer. | Upper bound for "context + reliable control" |
 
-The ContextEngine agent is a **deterministic pipeline**, not an LLM tool-calling loop.
-The context layer decides which metric to use and how to compute it; the LLM is called
-once, only to phrase the final answer from the collected context.
+### ContextEngine pipeline workflow
 
 ```
-1. User: "What was our revenue last month?"
-2. search_assets("revenue")            (topic from keyword extraction)
-   → net_revenue, gross_revenue, recognized_revenue, ...
-3. Pick metric                          (explicitly named metric first, otherwise
-   → net_revenue                         rank by trust signal: certified > experimental > deprecated)
-4. get_definition("net_revenue")
-   → SUM(orders.net_amount) WHERE status = 'completed'
-5. get_trust_signal("net_revenue")
-   → certified, approved by Finance Team / CFO
-6. Build SQL from the definition + date filter parsed from the question, then execute_sql
-   → SELECT SUM(net_amount) ... WHERE status = 'completed' AND order_date >= '...' AND order_date < '...'
-7. LLM formats a short answer citing the metric, its source and certification status
+1. User: "What was revenue by product category in July 2026?"
+2. search_assets("revenue")              topic from keywords + synonyms (sales/turnover → revenue)
+3. Pick metric                           explicitly named metric first, otherwise rank candidates by
+   → net_revenue                         trust signal (certified > experimental > stale > deprecated);
+                                         reject candidates unrelated to the question
+4. get_definition("net_revenue")         SUM(orders.net_amount) WHERE status = 'completed'
+5. get_trust_signal("net_revenue")       certified, approved by Finance Team / CFO
+6. (get_schema / get_lineage / list_metrics when the question is about columns,
+    relationships or which metrics are deprecated)
+7. Build SQL from the definition + what the question asks for, then execute_sql:
+     SELECT p.category, SUM(net_amount) FROM business.orders o
+     JOIN business.products p ON p.id = o.product_id
+     WHERE status = 'completed' AND order_date >= '2026-07-01' AND order_date < '2026-08-01'
+     GROUP BY p.category ORDER BY net_revenue DESC
+8. LLM phrases a short answer citing metric, source and certification status
+   (without an LLM configured, a plain-text answer is returned instead)
 ```
 
-**Why a pipeline?** With small free-tier models (7–8B parameters) the LLM-driven version
-frequently skipped the definition lookup or stopped before running SQL. A fixed pipeline makes
-the context layer's effect reliable and testable. The trade-off: it cannot answer questions the
-templates don't cover (see Limitations).
+The SQL builder supports date ranges ("July 2026", "last month", "in 2025"), multi-month comparisons ("June and July 2026"), monthly trends, customer-segment filters and group-bys, product-category group-bys and top-N products.
 
-### Baseline Agent (Control Group)
-
-The baseline agent is a LangGraph ReAct loop: the LLM sees the table/column names in its system
-prompt and writes SQL itself via an `execute_sql` tool. It has **no access** to business
-definitions, trust signals, or other context tools.
-
-> **Note on the comparison:** the two agents differ in *two* ways — access to context **and**
-> control strategy (LLM-written SQL vs. definition-templated SQL). Results therefore measure the
-> combined effect. A cleaner ablation would give both agents the same LangGraph loop and only vary
-> the tool list.
+**Why keep a pipeline?** With small free-tier models (7–8B parameters) an LLM-driven agent often skips the definition lookup or stops before running SQL. The pipeline makes the context layer's effect reliable and unit-testable; the ReAct variant shows how much of that an LLM achieves on its own.
 
 ---
 
@@ -133,7 +125,11 @@ Each piece of context is a queryable record with typed fields — not embedded i
 
 ## MCP Server
 
-Tools are exposed via the [Model Context Protocol](https://modelcontextprotocol.io/), providing a standardized interface between the agent and the context/data layer.
+The same tools are exposed via the [Model Context Protocol](https://modelcontextprotocol.io/), so any MCP client (Claude Desktop, IDEs, other agent frameworks) can use the context layer:
+
+```bash
+python -m app.mcp.server     # stdio transport
+```
 
 | Tool | Purpose |
 |------|---------|
@@ -145,78 +141,51 @@ Tools are exposed via the [Model Context Protocol](https://modelcontextprotocol.
 | `execute_sql(query)` | Run read-only SQL (SELECT only, validated) |
 | `list_metrics()` | List all available metric definitions |
 
-**Why MCP?** It decouples the agent from the underlying implementation. The agent discovers capabilities through a standard protocol rather than hardcoding internal APIs. This makes the system extensible without changing agent code.
+The agents call the shared `ContextTools` implementation in-process (lower latency, simpler deployment); the MCP server wraps the same class, and `tests/test_mcp_server.py` drives it end to end with the official MCP client over stdio.
 
 ---
 
 ## Evaluation
 
-### Setup
+All three agents answer the same 25 questions (`evaluation/dataset.json`). 15 numeric questions have **gold SQL**; 5 questions require a **warning** (deprecated, draft, experimental or unreliable asset).
 
-Two agents are evaluated on the same 25 benchmark questions:
+### Scoring dimensions
 
-- **Baseline**: schema + SQL execution only
-- **ContextEngine**: schema + SQL + full context layer via MCP tools
+| Dimension | What it measures | Applies to |
+|-----------|-----------------|---|
+| **execution_accuracy** | The agent's SQL, re-executed, returns the gold result (order/column-insensitive, 0.5% tolerance) | 15 questions with gold SQL |
+| **metric_selection** | Answer names the expected metric, or the SQL computes it (right column + filter) | questions with an expected metric |
+| **source_selection** | Right table and column | questions with an expected source |
+| **sql_correctness** | Required filter conditions present in the SQL | questions with an expected filter |
+| **groundedness** | Answer states a number the SQL actually returned, names a source, used tools | all |
+| **trust_awareness** | Answer warns about the deprecated/draft/experimental/unreliable asset | 5 questions |
+| **tool_success** | Tool calls without errors | answers that used tools |
 
-### Scoring Dimensions
+Dimensions that don't apply to a question are excluded from its averages. Scorers are judged from the answer and the SQL only, so the baseline can earn full marks by writing the right SQL — no points are given just for calling a context tool.
 
-| Dimension | What it measures |
-|-----------|-----------------|
-| **Metric Selection** | Did the agent pick the correct business metric? |
-| **Source Selection** | Did it use the correct table/column? |
-| **SQL Correctness** | Were the right filters applied? |
-| **Groundedness** | Does the answer cite actual sources? |
-| **Tool Success** | Did tool calls execute without errors? |
-
-### Benchmark Categories
-
-- **metric_selection** (10 questions): Ambiguous metrics where context determines the right choice
-- **context_awareness** (7 questions): Questions about metadata, ownership, definitions
-- **trust_signal** (3 questions): Questions testing deprecated/experimental awareness
-- **lineage** (1 question): Relationship understanding
-- **simple_query** (4 questions): Straightforward queries (control — both should pass)
-
-### Running Evaluation
+### Running the evaluation
 
 ```bash
-# Run full evaluation (both agents, all 25 questions)
-python -m evaluation.runner
-
-# Run only ContextEngine agent
-python -m evaluation.runner --agent contexthub
-
-# Run subset for quick testing
-python -m evaluation.runner --questions 5
-
-# Generate markdown report from results
-python -m evaluation.report
+python -m evaluation.runner                         # all three agents, 25 questions
+python -m evaluation.runner --agent both            # baseline + pipeline
+python -m evaluation.runner --agent contexthub_react --questions 5
+python -m evaluation.runner --runs 3                # repeat; report mean +/- std
+python -m evaluation.report                         # markdown report of the latest run
 ```
 
----
+### Results
 
-## Results
+Measured so far (seeded database, **no LLM configured**, so the pipeline used its plain-text answer):
 
-> **Note:** Actual evaluation results will be generated when you run the evaluation with a configured LLM. Results depend on the specific model used.
+| Dimension | ContextEngine (pipeline) |
+|---|---|
+| execution_accuracy | 86.7% (13/15) |
+| metric_selection | 100% |
+| sql_correctness | 80.8% |
+| trust_awareness | 100% |
+| overall | 95.0% |
 
-The evaluation is designed to demonstrate differences in these key scenarios:
-
-### Expected Failure Case: Revenue Selection
-
-**Question:** "What was our revenue last month?"
-
-| Agent | Metric Selected | Why |
-|-------|----------------|-----|
-| Baseline | `total_amount` (wrong) | Sees "total" in column name, assumes it means revenue |
-| ContextEngine | `net_amount` (correct) | Looks up `net_revenue` definition → certified, maps to `net_amount` with `status='completed'` filter |
-
-### Expected Failure Case: Active Customers
-
-**Question:** "How many active customers do we have?"
-
-| Agent | Logic | Issue |
-|-------|-------|-------|
-| Baseline | `WHERE is_active = true` | Misses the 90-day recency requirement |
-| ContextEngine | `WHERE is_active = true AND last_order_date >= ...` | Applies certified definition |
+The two execution misses are "How many orders were cancelled?" and "What payment methods do customers use most?": no certified metric covers them, so the pipeline says so instead of guessing. The baseline and ReAct agents need an LLM and have **not been run yet** — results depend on the model, so run the evaluation with your provider and commit the report rather than quoting expected numbers.
 
 ---
 
@@ -224,14 +193,14 @@ The evaluation is designed to demonstrate differences in these key scenarios:
 
 | Decision | Rationale |
 |----------|-----------|
-| **LangGraph for the baseline** | Structured state + tool-calling loop for the LLM-driven control agent |
-| **Deterministic pipeline for ContextEngine** | Small free models were unreliable at multi-step tool use; a fixed pipeline makes the context layer's effect reliable and unit-testable |
+| **One ReAct graph for baseline and ContextEngine ReAct** | Same LLM, loop and schema prompt; only the tools differ → the comparison isolates the context layer |
+| **Deterministic pipeline as a third agent** | Small free models are unreliable at multi-step tool use; the pipeline shows the effect of context with reliable control and is unit-testable |
 | **PostgreSQL for context** | Structured, queryable context. Not a vector store — metrics have known fields, not fuzzy semantics |
-| **In-process tools + separate MCP server** | Agents call the shared `ContextTools` class directly (simplicity, latency). The same tools are exposed over MCP (`python -m app.mcp.server`) for any MCP client |
-| **Free-tier LLMs** | Gemini 2.0 Flash (free), Groq (free), Ollama (local). No paid API required |
-| **Read-only SQL** | SQL validation + read-only DB user. Agent cannot mutate data |
+| **In-process tools + MCP server** | Agents call the shared `ContextTools` class directly (simplicity, latency); the MCP server exposes the same tools to any MCP client |
+| **Free-tier LLMs** | Gemini (free tier), Groq (free tier), Ollama (local). No paid API required |
+| **Read-only SQL** | SQL validation + read-only DB role + statement timeout. Agents cannot mutate data |
 | **Single PostgreSQL instance** | Business data and context in one DB (different schemas). Minimizes infrastructure |
-| **25 benchmark questions** | Enough to demonstrate patterns without requiring hours of API calls |
+| **Execution accuracy as the primary score** | Keyword checks can be gamed; comparing query results against gold SQL cannot |
 | **No vector search** | Context is structured with known fields. Exact lookup > semantic search for definitions |
 
 ---
@@ -242,38 +211,35 @@ The evaluation is designed to demonstrate differences in these key scenarios:
 
 - Python 3.11+
 - Docker (for PostgreSQL)
-- One of: Gemini API key (free), Groq API key (free), or Ollama installed
+- For the LLM agents: a Gemini API key (free), a Groq API key (free), or Ollama installed
 
 ### Setup
 
 ```bash
-# 1. Clone and enter directory
-cd contexthub
-
-# 2. Start PostgreSQL
+# 1. Start PostgreSQL
 docker compose up -d
 
-# 3. Install dependencies
+# 2. Install dependencies
 pip install -r requirements.txt
 
-# 4. Configure environment
+# 3. Configure environment
 cp .env.example .env
-# Edit .env with your LLM API key (see options below)
+# Edit .env with your LLM provider / API key (see below)
 
-# 5. Seed database (business data + context layer)
+# 4. Seed database (business data + context layer)
 python seed.py
-# Seeding skips if data exists. To re-seed after context changes:
+# Seeding skips if data exists. To re-seed from scratch (needed after model changes):
 #   docker compose down -v && docker compose up -d && python seed.py
 
-# 6. Run the CLI
+# 5. Run the CLI
 python cli.py
 ```
 
 ### LLM Configuration
 
-Choose one (all free):
+Choose one:
 
-**Google Gemini (recommended):**
+**Google Gemini:**
 ```env
 LLM_PROVIDER=gemini
 GEMINI_API_KEY=your-key-from-https://aistudio.google.com/apikey
@@ -287,34 +253,39 @@ GROQ_API_KEY=your-key-from-https://console.groq.com/keys
 
 **Ollama (fully local, no API key):**
 ```bash
-ollama pull llama3.1
+ollama pull qwen2.5:7b
 ```
 ```env
 LLM_PROVIDER=ollama
-OLLAMA_MODEL=llama3.1
+OLLAMA_MODEL=qwen2.5:7b
 ```
+
+**OpenRouter:** `LLM_PROVIDER=openrouter` and `OPENROUTER_API_KEY=...`
 
 ### Usage
 
 ```bash
-# Interactive CLI
+# Interactive CLI (pipeline agent)
 python cli.py
+python cli.py --agent contexthub_react
+python cli.py --baseline
 
-# Compare both agents side-by-side
-python cli.py --compare
+# Compare all three agents side-by-side
+python cli.py --compare -q "What was our revenue in July 2026?"
 
-# Single question
-python cli.py -q "What was our revenue in July?"
-
-# API server
+# API server  (docs at http://localhost:8000/docs)
 uvicorn app.main:app --reload
-# Then: POST http://localhost:8000/ask {"question": "..."}
+# POST /ask {"question": "...", "agent": "contexthub" | "contexthub_react" | "baseline"}
+# GET /agents, /metrics, /schema/{table}, /health
 
-# Run tests
+# Web UI (needs the API running)
+python frontend/serve.py      # http://localhost:3000
+
+# MCP server
+python -m app.mcp.server
+
+# Tests (database tests are skipped automatically if Postgres isn't running)
 pytest tests/ -v
-
-# Run evaluation
-python -m evaluation.runner
 ```
 
 ---
@@ -325,35 +296,42 @@ python -m evaluation.runner
 contexthub/
 ├── app/
 │   ├── config.py              # Pydantic settings (LLM provider, DB URL)
-│   ├── main.py                # FastAPI app (/ask, /health, /metrics)
+│   ├── main.py                # FastAPI app (/ask, /agents, /metrics, /schema, /health)
 │   ├── agent/
-│   │   ├── baseline.py        # LangGraph agent: schema-only
-│   │   ├── contexthub.py      # Deterministic context pipeline
-│   │   ├── llm.py             # LLM factory (Gemini/Groq/Ollama)
-│   │   └── prompts.py         # System prompts for both agents
+│   │   ├── react.py           # Shared LangGraph ReAct loop
+│   │   ├── baseline.py        # Baseline: ReAct + execute_sql only
+│   │   ├── contexthub_react.py# ContextEngine ReAct: ReAct + all 7 tools
+│   │   ├── contexthub.py      # ContextEngine pipeline (deterministic)
+│   │   ├── tools.py           # LangChain wrappers around ContextTools
+│   │   ├── registry.py        # Builds agents by name (API, CLI, evaluation)
+│   │   ├── llm.py             # LLM factory (Gemini/Groq/Ollama/OpenRouter)
+│   │   └── prompts.py         # System prompts
 │   ├── context/
-│   │   ├── models.py          # SQLAlchemy: assets, definitions, trust, lineage
+│   │   ├── models.py          # SQLAlchemy: assets, definitions, trust, schema info, lineage
 │   │   ├── seed.py            # Seeds business definitions and trust signals
 │   │   └── service.py         # Context retrieval logic
 │   ├── db/
-│   │   ├── connection.py      # SQLAlchemy engine (read-only support)
+│   │   ├── connection.py      # Cached engines, read-only role, statement timeout
 │   │   ├── models.py          # Business data: customers, orders, products, payments
 │   │   └── seed.py            # Generates ~11K records of realistic data
 │   └── mcp/
 │       ├── server.py          # MCP server (stdio transport)
 │       └── tools.py           # Tool implementations + SQL validation
 ├── evaluation/
-│   ├── dataset.json           # 25 benchmark questions with expected outputs
-│   ├── runner.py              # Runs both agents, scores 5 dimensions
-│   └── report.py              # Generates markdown comparison report
-├── tests/
-│   ├── test_context.py        # Context service tests (16 tests, need seeded DB)
-│   ├── test_mcp.py            # SQL safety (16, no DB) + tool tests (10, need DB)
-│   └── test_agent.py          # Pipeline logic + scoring tests (29, no DB/LLM)
+│   ├── dataset.json           # 25 questions: expected metric/source/filter, gold SQL, warnings
+│   ├── runner.py              # Runs agents, scores 7 dimensions, repeated runs
+│   └── report.py              # Markdown comparison report
+├── tests/                     # pytest; `db`-marked tests need the seeded database
+│   ├── test_agent.py          # Pipeline logic, ReAct loop (fake LLM), scorers
+│   ├── test_api.py            # FastAPI endpoints, concurrent requests
+│   ├── test_context.py        # Context service
+│   ├── test_mcp.py            # SQL safety + tools
+│   └── test_mcp_server.py     # MCP server over stdio with the official client
+├── frontend/                  # Single-page UI (ask, compare, metrics, schema)
 ├── cli.py                     # Rich interactive CLI with tool traces
 ├── seed.py                    # Unified seed script
 ├── docker-compose.yml         # PostgreSQL 16
-├── requirements.txt           # Dependencies (minimum versions)
+├── requirements.txt           # Dependencies (major versions bounded)
 └── .env.example               # Configuration template
 ```
 
@@ -361,36 +339,35 @@ contexthub/
 
 ## Security
 
-- **Read-only SQL execution**: The agent can only run SELECT queries. DROP/DELETE/UPDATE/INSERT/ALTER are rejected by both code validation and a read-only database user.
-- **SQL injection prevention**: Queries are validated against a pattern blocklist before execution.
-- **No secrets in code**: All API keys loaded from environment variables.
-- **Result limits**: All queries are limited to 100 rows to prevent data exfiltration.
+- **Read-only SQL execution**: only SELECT/WITH queries pass validation, and they run as a database role that only has SELECT privileges.
+- **Validator**: rejects DDL/DML keywords, stacked statements, comments, `SELECT ... INTO`, `COPY` and dangerous functions (`pg_sleep`, `pg_read_file`, ...). The database role is the real guarantee; the validator gives early, readable errors.
+- **Resource limits**: 10-second statement timeout; at most 100 rows returned.
+- **No secrets in code**: API keys are loaded from environment variables (`.env` is git-ignored).
+- **CORS**: credentials disabled; restrict `allow_origins` before deploying beyond localhost.
 
 ---
 
 ## Limitations
 
-- **Evaluation requires LLM API calls**: Real results need actual LLM inference. Free-tier rate limits mean evaluation takes ~2 minutes.
-- **Single database schema**: The demo uses 4 tables. Real enterprise environments have hundreds of tables with more complex ambiguities.
-- **No multi-turn conversation**: Each question is independent. A production system would maintain conversation context.
-- **Context is manually curated**: In production, context would be pulled from data catalogs rather than hand-seeded.
-- **No versioning**: Context definitions don't have version history or approval workflows.
-- **Limited RAG**: No unstructured document retrieval — only structured context. This is intentional to keep the experiment focused.
-- **Template-based SQL in the ContextEngine agent**: it computes a single aggregate per question (SUM / COUNT / AVG / rate) with the metric's filter and an optional date range. Group-bys ("by product category", "top 5 products"), extra filters ("enterprise customers") and multi-period comparisons ("June vs July") are not expressed in the SQL.
-- **Keyword-based topic and metric matching**: synonyms that don't appear in the context layer (e.g. "sales", "turnover") are not matched.
-- **Confounded comparison**: the agents differ in both context access and control strategy (see *Baseline Agent*).
-- **Heuristic scoring**: scores check whether expected metric names, columns, filters and trust words appear in the answer/SQL. They do not verify the numeric result, and the groundedness score rewards trust vocabulary that only the ContextEngine agent is prompted to use. Execution-accuracy scoring against gold SQL would be a stronger test.
+- **Small benchmark**: 25 questions on 4 tables of synthetic data. Real enterprise environments have hundreds of tables with more complex ambiguities.
+- **LLM-dependent results**: baseline and ReAct scores depend on the model; small free models are noisy (use `--runs`).
+- **Pipeline coverage**: the SQL builder handles the patterns listed above; arbitrary questions (e.g. counts by status, payment methods) fall outside its templates — that's what the ReAct agent is for.
+- **Keyword topic matching in the pipeline**: a fixed synonym list; unseen phrasings may not match a metric.
+- **Heuristic secondary scores**: metric/source/filter/groundedness/trust scores look for keywords; execution accuracy is the robust measure.
+- **No multi-turn conversation**: each question is independent.
+- **Context is manually curated**: in production it would come from a data catalog or dbt.
+- **No versioning**: context definitions don't have version history or approval workflows.
 
 ---
 
 ## Future Work
 
-- **Data catalog integration**: Replace the manual context layer with live data from an enterprise data catalog API
-- **Confidence scoring**: Have the agent self-assess answer confidence based on context availability
-- **Multi-turn context**: Maintain conversation state for follow-up questions
-- **Context freshness alerts**: Warn when context was last validated >30 days ago
-- **A/B evaluation at scale**: Run evaluation across different LLMs and compare
-- **Automated context ingestion**: Parse dbt schema files or data catalog exports into the context layer
+- **Data catalog integration**: replace the manual context layer with live data from a data catalog API
+- **Automated context ingestion**: parse dbt schema files or catalog exports into the context layer
+- **Hybrid retrieval**: semantic search over definitions for synonyms, filtered by trust level
+- **Multi-turn context**: LangGraph checkpointer for follow-up questions
+- **Context freshness alerts**: warn when context was last validated >30 days ago
+- **Model sweep**: run the evaluation across several LLMs and compare
 
 ---
 
@@ -398,14 +375,14 @@ contexthub/
 
 | Component | Technology | Why |
 |-----------|-----------|-----|
-| Agent framework | LangGraph | Structured state + tool calling patterns |
-| LLM | Gemini 2.0 Flash / Groq / Ollama | Free-tier, good function calling |
+| Agent framework | LangGraph | Explicit state machine for the ReAct loop; shared by both LLM agents |
+| LLM | Gemini / Groq / Ollama / OpenRouter | Free-tier or local; swap with one env var |
 | Tool protocol | MCP (Model Context Protocol) | Standardized agent-tool interface |
 | Database | PostgreSQL 16 | Single DB for data + context |
-| ORM | SQLAlchemy 2.0 | Type-safe models, schema management |
-| API | FastAPI | Async, auto-docs, Pydantic validation |
-| CLI | Rich + Click | Beautiful terminal output for demos |
-| Testing | pytest | Standard Python testing |
+| ORM | SQLAlchemy 2.x | Typed models, parameterized context queries |
+| API | FastAPI | Pydantic validation, auto-docs |
+| CLI | Rich + Click | Readable tool traces for demos |
+| Testing | pytest | Unit tests (fake LLM) + DB integration tests |
 | Config | pydantic-settings | Validated env config |
 
 ---
