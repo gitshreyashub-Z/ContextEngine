@@ -1,27 +1,32 @@
 """Evaluation runner for ContextEngine.
 
-Runs both baseline and ContextEngine agents on the benchmark dataset,
-scores them on 5 dimensions, and produces a comparison report.
+Runs the agents on the benchmark dataset, scores every answer on 7 dimensions and
+saves the results for evaluation/report.py.
+
+Agents:
+    baseline          LangGraph ReAct loop, execute_sql only (control)
+    contexthub_react  same loop + same prompt + the 6 context tools (clean ablation)
+    contexthub        deterministic context pipeline (LLM only formats the answer)
 
 Usage:
-    python -m evaluation.runner [--questions N] [--agent baseline|contexthub|both]
+    python -m evaluation.runner [--agent all|both|baseline|contexthub|contexthub_react]
+                                [--questions N] [--runs N]
 """
 
 import json
 import logging
-import os
+import math
 import re
+import statistics
 import sys
 import time
 from datetime import datetime
+from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-from app.agent.baseline import BaselineAgent
-from app.agent.contexthub import ContextEngineAgent
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +34,50 @@ EVAL_DIR = Path(__file__).parent
 DATASET_PATH = EVAL_DIR / "dataset.json"
 RESULTS_DIR = EVAL_DIR / "results"
 
+DIMENSIONS = [
+    "execution_accuracy",
+    "metric_selection",
+    "source_selection",
+    "sql_correctness",
+    "groundedness",
+    "trust_awareness",
+    "tool_success",
+]
+
+AGENT_CHOICES = {
+    "all": ["baseline", "contexthub_react", "contexthub"],
+    "both": ["baseline", "contexthub"],
+    "baseline": ["baseline"],
+    "contexthub": ["contexthub"],
+    "contexthub_react": ["contexthub_react"],
+}
+
+WARNING_WORDS = ["deprecated", "experimental", "draft", "stale", "not reliable", "unreliable", "do not use",
+                 "don't use", "not approved", "not recommended", "should not", "shouldn't", "caution",
+                 "not sufficient", "isn't sufficient", "is not sufficient", "not enough"]
+
+SOURCE_WORDS = ["table", "column", "orders", "customers", "payments", "products",
+                "net_amount", "total_amount", "metric", "definition"]
+
+Executor = Callable[[str], dict]
+
+
+def make_agent(name: str):
+    if name == "baseline":
+        from app.agent.baseline import BaselineAgent
+        return BaselineAgent()
+    if name == "contexthub":
+        from app.agent.contexthub import ContextEngineAgent
+        return ContextEngineAgent()
+    if name == "contexthub_react":
+        from app.agent.contexthub_react import ContextEngineReActAgent
+        return ContextEngineReActAgent()
+    raise ValueError(f"Unknown agent: {name}")
+
 
 def load_dataset(limit: int | None = None) -> list[dict]:
     """Load the evaluation dataset."""
-    with open(DATASET_PATH) as f:
+    with open(DATASET_PATH, encoding="utf-8") as f:
         data = json.load(f)
     questions = data["questions"]
     if limit:
@@ -40,386 +85,416 @@ def load_dataset(limit: int | None = None) -> list[dict]:
     return questions
 
 
-def score_metric_selection(response: dict, expected: dict) -> float:
-    """Score whether the agent selected the correct metric.
+# --------------------------------------------------------------------------- helpers
 
-    Returns 1.0 for correct, 0.5 for partial, 0.0 for incorrect.
+def _executed_queries(response: dict) -> list[str]:
+    return [str(c.get("args", {}).get("query", "")) for c in response.get("tool_calls", [])
+            if c.get("tool") == "execute_sql"]
+
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float, Decimal)) and not isinstance(v, bool)
+
+
+def _split_values(rows: list[dict]) -> tuple[list[float | None], list[str]]:
+    numbers: list[float | None] = []
+    strings: list[str] = []
+    for row in rows:
+        for v in row.values():
+            if v is None:
+                numbers.append(None)
+            elif _is_number(v):
+                numbers.append(float(v))
+            else:
+                strings.append(str(v).lower())
+    return numbers, strings
+
+
+def _close(a: float, b: float) -> bool:
+    return math.isclose(a, b, rel_tol=0.005, abs_tol=0.01)
+
+
+def results_match(gold_rows: list[dict], pred_rows: list[dict]) -> bool:
+    """Does the predicted result contain the gold result?
+
+    Order-insensitive and column-name-insensitive. Every gold number must be matched
+    by a distinct predicted number (0.5% tolerance; a percentage may be given as a
+    fraction or vice versa) and every gold label (category, month, ...) must be a
+    prefix of some predicted label. Extra predicted columns are allowed.
     """
-    expected_metric = expected.get("expected_metric")
-    if not expected_metric:
-        return 1.0  # No metric expected, skip
+    g_nums, g_strs = _split_values(gold_rows)
+    p_nums, p_strs = _split_values(pred_rows)
 
-    answer = response.get("answer", "").lower()
-    tool_calls = response.get("tool_calls", [])
+    for g in g_strs:
+        if not any(p.startswith(g) for p in p_strs):
+            return False
 
-    # Check if the expected metric appears in the answer
-    metric_normalized = expected_metric.lower().replace("_", " ")
-    metric_with_underscore = expected_metric.lower()
+    remaining = list(p_nums)
+    for g in g_nums:
+        for i, p in enumerate(remaining):
+            if g is None or p is None:
+                ok = g is None and p is None
+            else:
+                ok = _close(g, p) or _close(g, p * 100) or _close(g * 100, p)
+            if ok:
+                remaining.pop(i)
+                break
+        else:
+            return False
+    return True
 
-    if metric_with_underscore in answer or metric_normalized in answer:
-        return 1.0
 
-    # Check if the metric was looked up via tools
-    for call in tool_calls:
-        if call.get("tool") == "get_definition":
-            args = call.get("args", {})
-            if expected_metric.lower() in str(args).lower():
-                return 0.75  # Looked it up but may not have used it
+_SCALE = {"thousand": 1e3, "k": 1e3, "lakh": 1e5, "lakhs": 1e5, "million": 1e6, "mn": 1e6,
+          "crore": 1e7, "crores": 1e7, "cr": 1e7, "billion": 1e9, "bn": 1e9}
 
-    # Check for related column reference
-    expected_col = expected.get("expected_source_column", "")
-    if expected_col and expected_col.lower() in answer:
-        return 0.5  # Used correct column but didn't name the metric
 
+def _numbers_in_text(text: str) -> list[float]:
+    values = []
+    for m in re.finditer(r"(\d[\d,]*(?:\.\d+)?)\s*(thousand|k|lakhs?|million|mn|crores?|cr|billion|bn)?\b",
+                         text.lower()):
+        try:
+            v = float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        values.append(v * _SCALE.get(m.group(2) or "", 1))
+    return values
+
+
+# --------------------------------------------------------------------------- scorers
+# Each scorer returns a value in [0, 1], or None when the dimension does not apply
+# to the question. Averages are taken over applicable questions only.
+
+def score_execution_accuracy(response: dict, expected: dict, executor: Executor | None) -> float | None:
+    """1.0 if any SQL the agent executed returns the gold result, else 0.0."""
+    gold_sql = expected.get("gold_sql")
+    if not gold_sql or executor is None:
+        return None
+    gold = executor(gold_sql)
+    if "rows" not in gold:
+        raise RuntimeError(f"Gold SQL for {expected.get('id')} failed: {gold.get('error')}")
+    for query in _executed_queries(response):
+        pred = executor(query)
+        if "rows" in pred and results_match(gold["rows"], pred["rows"]):
+            return 1.0
     return 0.0
 
 
-def score_source_selection(response: dict, expected: dict) -> float:
-    """Score whether the agent chose the correct source table/column.
+def score_metric_selection(response: dict, expected: dict) -> float | None:
+    """Did the agent choose the right business metric?
 
-    Returns 1.0 for correct table+column, 0.5 for correct table only.
+    1.0 if the answer names the expected metric, or the executed SQL uses the metric's
+    column on its table with all parts of its filter; 0.5 if the right column is used
+    or named; 0.0 otherwise. Judged from the answer and SQL only, so an agent without
+    context tools can score full marks by writing the right SQL.
     """
+    expected_metric = expected.get("expected_metric")
+    if not expected_metric:
+        return None
+
     answer = response.get("answer", "").lower()
-    tool_calls = response.get("tool_calls", [])
-
-    expected_table = expected.get("expected_source_table", "")
-    expected_column = expected.get("expected_source_column", "")
-
-    if not expected_table:
-        return 1.0  # No source expected
-
-    # Check SQL in tool calls
-    sql_queries = []
-    for call in tool_calls:
-        if call.get("tool") == "execute_sql":
-            sql_queries.append(str(call.get("args", {}).get("query", "")).lower())
-
-    all_text = answer + " " + " ".join(sql_queries)
-
-    table_name = expected_table.replace("business.", "")
-    has_table = table_name in all_text or expected_table.lower() in all_text
-    has_column = expected_column.lower() in all_text if expected_column else True
-
-    if has_table and has_column:
+    if expected_metric.lower() in answer or expected_metric.lower().replace("_", " ") in answer:
         return 1.0
-    elif has_table:
+
+    column = (expected.get("expected_source_column") or "").lower()
+    table = (expected.get("expected_source_table") or "").lower().replace("business.", "")
+    filter_parts = [p.strip().lower() for p in re.split(r"\s+AND\s+", expected.get("expected_filter") or "",
+                                                         flags=re.IGNORECASE) if p.strip()]
+    for query in (q.lower() for q in _executed_queries(response)):
+        uses_column = column and column in query and table in query
+        if uses_column and all(p in query or _fuzzy_filter_match(p, query) for p in filter_parts):
+            return 1.0
+
+    all_text = answer + " " + " ".join(_executed_queries(response)).lower()
+    if column and column in all_text:
         return 0.5
     return 0.0
 
 
-def score_sql_correctness(response: dict, expected: dict) -> float:
-    """Score SQL correctness based on expected filters and structure.
+def score_source_selection(response: dict, expected: dict) -> float | None:
+    """1.0 for correct table+column in answer/SQL, 0.5 for correct table only."""
+    expected_table = expected.get("expected_source_table", "")
+    expected_column = expected.get("expected_source_column", "")
+    if not expected_table:
+        return None
 
-    Returns 1.0 if correct filters applied, 0.5 for partial, 0.0 for wrong.
-    """
+    all_text = (response.get("answer", "") + " " + " ".join(_executed_queries(response))).lower()
+    table_name = expected_table.replace("business.", "").lower()
+    has_table = table_name in all_text
+    has_column = expected_column.lower() in all_text if expected_column else True
+
+    if has_table and has_column:
+        return 1.0
+    if has_table:
+        return 0.5
+    return 0.0
+
+
+def score_sql_correctness(response: dict, expected: dict) -> float | None:
+    """Fraction of the expected filter's parts present in the executed SQL."""
     expected_filter = expected.get("expected_filter")
-    tool_calls = response.get("tool_calls", [])
-
-    # If no filter expected, check if SQL was executed at all
     if not expected_filter:
-        for call in tool_calls:
-            if call.get("tool") == "execute_sql":
-                # Check if it returned results (no error)
-                result_preview = call.get("result_preview", "")
-                if "error" not in result_preview.lower():
-                    return 1.0
-        # No SQL needed or no SQL executed
-        return 1.0 if expected.get("category") == "context_awareness" else 0.5
+        return None
 
-    # Check if the filter condition appears in executed SQL
-    sql_queries = []
-    for call in tool_calls:
-        if call.get("tool") == "execute_sql":
-            query = str(call.get("args", {}).get("query", "")).lower()
-            sql_queries.append(query)
-
+    sql_queries = [q.lower() for q in _executed_queries(response)]
     if not sql_queries:
         return 0.0
 
-    # Parse expected filter parts
-    filter_parts = re.split(r'\s+AND\s+', expected_filter, flags=re.IGNORECASE)
-    matched_parts = 0
-
+    filter_parts = [p for p in re.split(r"\s+AND\s+", expected_filter, flags=re.IGNORECASE) if p.strip()]
+    matched = 0
     for part in filter_parts:
         part_lower = part.lower().strip()
-        for query in sql_queries:
-            if part_lower in query or _fuzzy_filter_match(part_lower, query):
-                matched_parts += 1
-                break
+        if any(part_lower in q or _fuzzy_filter_match(part_lower, q) for q in sql_queries):
+            matched += 1
+    return matched / len(filter_parts)
 
-    if len(filter_parts) == 0:
-        return 1.0
 
-    return matched_parts / len(filter_parts)
+def _strip_qualifiers(sql: str) -> str:
+    """'customers.segment' / 'c.segment' -> 'segment', and drop whitespace."""
+    sql = re.sub(r"\b[a-z_]+\.(?=[a-z_])", "", sql.lower())
+    return re.sub(r"\s+", "", sql)
 
 
 def _fuzzy_filter_match(expected_part: str, query: str) -> bool:
-    """Fuzzy matching for filter conditions (handles slight variations)."""
-    # Handle common variations
+    """Fuzzy matching for filter conditions (whitespace, table aliases, small variations)."""
+    compact_query = _strip_qualifiers(query)
+    compact_part = _strip_qualifiers(expected_part)
+    if compact_part in compact_query:
+        return True
     variations = {
-        "status = 'completed'": ["status='completed'", "status = 'completed'", "\"status\" = 'completed'"],
-        "is_active = true": ["is_active = true", "is_active=true", "is_active = 't'"],
+        "is_active = true": ["is_active", "is_active='t'", "is_active is true"],
+        "last_order_date >= current_date - interval '90 days'": ["interval '90 days'", "interval '90 day'", "- 90"],
     }
-
-    for canonical, alts in variations.items():
-        if expected_part == canonical.lower():
-            for alt in alts:
-                if alt.lower() in query:
-                    return True
+    for alt in variations.get(expected_part, []):
+        if alt in query:
+            return True
     return False
 
 
-def score_groundedness(response: dict, expected: dict) -> float:
-    """Score whether the answer is grounded in actual data/context.
+def score_groundedness(response: dict, expected: dict) -> float | None:
+    """Is the answer grounded in data the agent actually retrieved?
 
-    Checks if the agent references specific sources, metrics, or data values.
+    Checks: (1) if SQL returned numbers, the answer states one of them (allowing
+    thousand/lakh/crore/million formatting); (2) the answer names a source (table,
+    column, metric); (3) tools were used. Trust vocabulary is deliberately not
+    rewarded here - see trust_awareness.
     """
     answer = response.get("answer", "")
     tool_calls = response.get("tool_calls", [])
-
     if not answer:
         return 0.0
 
-    score = 0.0
-    checks = 0
+    checks: list[float] = []
 
-    # Check 1: Does the answer reference specific data?
-    checks += 1
-    has_specific_data = bool(re.search(r'\d+[,.]?\d*', answer))  # Contains numbers
-    if has_specific_data:
-        score += 1.0
-
-    # Check 2: Does the answer mention the source?
-    checks += 1
-    source_indicators = ["table", "column", "orders", "customers", "payments", "products",
-                         "net_amount", "total_amount", "metric", "definition"]
-    mentions_source = any(ind in answer.lower() for ind in source_indicators)
-    if mentions_source:
-        score += 1.0
-
-    # Check 3: Does the answer reference certification/trust status?
-    checks += 1
-    trust_indicators = ["certified", "deprecated", "experimental", "approved", "trusted"]
-    mentions_trust = any(ind in answer.lower() for ind in trust_indicators)
-    if mentions_trust:
-        score += 1.0
-
-    # Check 4: Did the agent actually use tools to get data?
-    checks += 1
-    if tool_calls:
-        score += 1.0
-
-    return score / checks if checks > 0 else 0.0
-
-
-def score_tool_success(response: dict, expected: dict) -> float:
-    """Score whether tools were called successfully (no errors).
-
-    Returns ratio of successful tool calls to total tool calls.
-    """
-    tool_calls = response.get("tool_calls", [])
-
-    if not tool_calls:
-        # For context_awareness questions, having no tool calls for baseline is expected
-        if expected.get("category") in ("context_awareness", "trust_signal", "lineage"):
-            return 0.0  # Should have used tools
-        return 0.5  # Neutral for simple queries
-
-    successful = 0
+    result_numbers = []
     for call in tool_calls:
-        result = call.get("result_preview", "")
-        if "error" not in result.lower():
-            successful += 1
+        if call.get("tool") == "execute_sql":
+            # Values of result columns (skipping bookkeeping fields like row_count / elapsed_ms)
+            result_numbers += [float(n) for n in re.findall(
+                r'"(?!row_count|elapsed_ms)[^"]+":\s*"?(-?\d+(?:\.\d+)?)', call.get("result_preview", ""))]
+    if result_numbers:
+        answer_numbers = _numbers_in_text(answer)
+        hit = any(_close(a, r) or math.isclose(a, r, rel_tol=0.01) for a in answer_numbers for r in result_numbers)
+        checks.append(1.0 if hit else 0.0)
 
+    checks.append(1.0 if any(w in answer.lower() for w in SOURCE_WORDS) else 0.0)
+    checks.append(1.0 if tool_calls else 0.0)
+    return sum(checks) / len(checks)
+
+
+def score_trust_awareness(response: dict, expected: dict) -> float | None:
+    """For questions about deprecated/draft/experimental/unreliable assets: does the answer warn?"""
+    if not expected.get("expects_warning"):
+        return None
+    answer = response.get("answer", "").lower()
+    return 1.0 if any(w in answer for w in WARNING_WORDS) else 0.0
+
+
+def score_tool_success(response: dict, expected: dict) -> float | None:
+    """Ratio of tool calls that returned no error (None if no tools were called)."""
+    tool_calls = response.get("tool_calls", [])
+    if not tool_calls:
+        return None
+    successful = sum(1 for c in tool_calls if '"error"' not in c.get("result_preview", "").lower())
     return successful / len(tool_calls)
 
 
-def evaluate_response(response: dict, expected: dict) -> dict[str, float]:
+def evaluate_response(response: dict, expected: dict, executor: Executor | None = None) -> dict[str, float | None]:
     """Evaluate a single agent response against expected results."""
     return {
+        "execution_accuracy": score_execution_accuracy(response, expected, executor),
         "metric_selection": score_metric_selection(response, expected),
         "source_selection": score_source_selection(response, expected),
         "sql_correctness": score_sql_correctness(response, expected),
         "groundedness": score_groundedness(response, expected),
+        "trust_awareness": score_trust_awareness(response, expected),
         "tool_success": score_tool_success(response, expected),
     }
 
 
+def average_scores(scores: list[dict]) -> dict[str, float | None]:
+    """Mean per dimension over the questions where it applies."""
+    totals = {}
+    for dim in DIMENSIONS:
+        values = [s[dim] for s in scores if s.get(dim) is not None]
+        totals[dim] = round(sum(values) / len(values), 4) if values else None
+    return totals
+
+
+def overall(totals: dict[str, float | None]) -> float:
+    values = [v for v in totals.values() if v is not None]
+    return sum(values) / len(values) if values else 0.0
+
+
+# --------------------------------------------------------------------------- running
+
+def run_agent_once(agent, questions: list[dict], executor: Executor, verbose: bool, delay: float) -> dict[str, Any]:
+    responses, scores = [], []
+    total_latency, total_tool_calls, errors = 0.0, 0, 0
+
+    for i, q in enumerate(questions):
+        if verbose:
+            print(f"  [{i+1}/{len(questions)}] {q['question'][:60]}...", end=" ", flush=True)
+        try:
+            response = agent.ask(q["question"])
+            question_scores = evaluate_response(response, q, executor)
+        except Exception as e:
+            logger.error(f"Error evaluating question {q['id']}: {e}")
+            response = {"answer": f"Error: {e}", "tool_calls": [], "latency_seconds": 0, "success": False}
+            question_scores = {dim: 0.0 for dim in DIMENSIONS}
+
+        responses.append({
+            "question_id": q["id"],
+            "question": q["question"],
+            "answer": response.get("answer", "")[:500],
+            "tool_calls": response.get("tool_calls", []),
+            "latency": response.get("latency_seconds", 0),
+            "success": response.get("success", False),
+        })
+        scores.append({"question_id": q["id"], **question_scores})
+        total_latency += response.get("latency_seconds", 0)
+        total_tool_calls += len(response.get("tool_calls", []))
+        if not response.get("success"):
+            errors += 1
+
+        if verbose:
+            avg = overall(question_scores)
+            status = "PASS" if avg > 0.6 else "PART" if avg > 0.3 else "FAIL"
+            exec_score = question_scores["execution_accuracy"]
+            exec_str = "-" if exec_score is None else f"{exec_score:.0f}"
+            print(f"{status} (avg {avg:.2f}, exec {exec_str}, {response.get('latency_seconds', 0):.1f}s)")
+
+        time.sleep(delay)  # Rate limiting for free-tier APIs
+
+    n = max(len(questions), 1)
+    return {
+        "responses": responses,
+        "scores": scores,
+        "totals": average_scores(scores),
+        "avg_latency": round(total_latency / n, 2),
+        "total_tool_calls": total_tool_calls,
+        "errors": errors,
+    }
+
+
+def aggregate_runs(runs: list[dict]) -> dict[str, Any]:
+    """Mean and standard deviation across repeated runs."""
+    mean, std = {}, {}
+    for dim in DIMENSIONS:
+        values = [r["totals"][dim] for r in runs if r["totals"][dim] is not None]
+        mean[dim] = round(statistics.mean(values), 4) if values else None
+        std[dim] = round(statistics.stdev(values), 4) if len(values) > 1 else 0.0
+    return {
+        # First run's details are kept at the top level for the per-question report
+        "responses": runs[0]["responses"],
+        "scores": runs[0]["scores"],
+        "totals": mean,
+        "totals_std": std,
+        "avg_latency": round(statistics.mean(r["avg_latency"] for r in runs), 2),
+        "total_tool_calls": round(statistics.mean(r["total_tool_calls"] for r in runs), 1),
+        "errors": sum(r["errors"] for r in runs),
+        "runs": [{"totals": r["totals"], "avg_latency": r["avg_latency"], "errors": r["errors"]} for r in runs],
+    }
+
+
 def run_evaluation(
-    agent_type: str = "both",
+    agent_type: str = "all",
     limit: int | None = None,
     verbose: bool = True,
+    runs: int = 1,
+    delay: float = 2.0,
 ) -> dict[str, Any]:
-    """Run the full evaluation pipeline.
+    """Run the full evaluation pipeline and save the results as JSON."""
+    from app.config import get_settings
+    from app.mcp.tools import ContextTools
 
-    Args:
-        agent_type: "baseline", "contexthub", or "both"
-        limit: Maximum number of questions to evaluate
-        verbose: Print progress during evaluation
-
-    Returns:
-        Complete evaluation results including per-question scores and averages.
-    """
     questions = load_dataset(limit)
+    executor = ContextTools().execute_sql
+    settings = get_settings()
 
     if verbose:
-        print(f"\n{'='*60}")
-        print(f"  ContextEngine Evaluation - {len(questions)} questions")
-        print(f"{'='*60}\n")
+        print(f"\n{'='*64}")
+        print(f"  ContextEngine Evaluation - {len(questions)} questions x {runs} run(s)")
+        print(f"  LLM provider: {settings.llm_provider.value}")
+        print(f"{'='*64}\n")
 
     results = {
         "timestamp": datetime.now().isoformat(),
         "num_questions": len(questions),
+        "num_runs": runs,
+        "llm_provider": settings.llm_provider.value,
+        "dimensions": DIMENSIONS,
         "agents": {},
     }
 
-    agents_to_run = []
-    if agent_type in ("baseline", "both"):
-        agents_to_run.append(("baseline", BaselineAgent()))
-    if agent_type in ("contexthub", "both"):
-        agents_to_run.append(("contexthub", ContextEngineAgent()))
-
-    for agent_name, agent in agents_to_run:
-        if verbose:
-            print(f"\n--- Running {agent_name.upper()} agent ---\n")
-
-        agent_results = {
-            "responses": [],
-            "scores": [],
-            "totals": {
-                "metric_selection": 0.0,
-                "source_selection": 0.0,
-                "sql_correctness": 0.0,
-                "groundedness": 0.0,
-                "tool_success": 0.0,
-            },
-            "avg_latency": 0.0,
-            "total_tool_calls": 0,
-            "errors": 0,
-        }
-
-        total_latency = 0.0
-
-        for i, q in enumerate(questions):
+    for agent_name in AGENT_CHOICES[agent_type]:
+        agent = make_agent(agent_name)
+        agent_runs = []
+        for run in range(runs):
             if verbose:
-                print(f"  [{i+1}/{len(questions)}] {q['question'][:60]}...", end=" ")
+                print(f"\n--- {agent_name.upper()} (run {run+1}/{runs}) ---\n")
+            agent_runs.append(run_agent_once(agent, questions, executor, verbose, delay))
+        results["agents"][agent_name] = aggregate_runs(agent_runs)
 
-            try:
-                response = agent.ask(q["question"])
-                scores = evaluate_response(response, q)
-
-                agent_results["responses"].append({
-                    "question_id": q["id"],
-                    "question": q["question"],
-                    "answer": response.get("answer", "")[:500],
-                    "tool_calls": response.get("tool_calls", []),
-                    "latency": response.get("latency_seconds", 0),
-                    "success": response.get("success", False),
-                })
-                agent_results["scores"].append({
-                    "question_id": q["id"],
-                    **scores,
-                })
-
-                for metric, value in scores.items():
-                    agent_results["totals"][metric] += value
-
-                total_latency += response.get("latency_seconds", 0)
-                agent_results["total_tool_calls"] += len(response.get("tool_calls", []))
-
-                if not response.get("success"):
-                    agent_results["errors"] += 1
-
-                if verbose:
-                    avg_score = sum(scores.values()) / len(scores)
-                    status = "✓" if avg_score > 0.6 else "△" if avg_score > 0.3 else "✗"
-                    print(f"{status} (avg: {avg_score:.2f}, latency: {response.get('latency_seconds', 0):.1f}s)")
-
-            except Exception as e:
-                logger.error(f"Error evaluating question {q['id']}: {e}")
-                agent_results["errors"] += 1
-                if verbose:
-                    print(f"✗ ERROR: {e}")
-
-            # Rate limiting for free tier APIs
-            time.sleep(2)
-
-        # Calculate averages
-        n = len(questions)
-        if n > 0:
-            for metric in agent_results["totals"]:
-                agent_results["totals"][metric] = round(agent_results["totals"][metric] / n, 4)
-            agent_results["avg_latency"] = round(total_latency / n, 2)
-
-        results["agents"][agent_name] = agent_results
-
-    # Print summary
-    if verbose and agent_type == "both":
+    if verbose and len(results["agents"]) > 1:
         print_comparison(results)
 
-    # Save results
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     results_path = RESULTS_DIR / f"eval_{timestamp}.json"
-    with open(results_path, "w") as f:
+    with open(results_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, default=str)
 
     if verbose:
         print(f"\nResults saved to: {results_path}")
-
     return results
 
 
+def _pct(value: float | None, std: float | None = None) -> str:
+    if value is None:
+        return "n/a"
+    return f"{value:.1%}" + (f" +/-{std:.1%}" if std else "")
+
+
 def print_comparison(results: dict) -> None:
-    """Print a formatted comparison table."""
-    print(f"\n{'='*60}")
-    print(f"  EVALUATION RESULTS")
-    print(f"{'='*60}\n")
-
-    header = f"{'Metric':<25} {'Baseline':>12} {'ContextEngine':>12} {'Δ':>8}"
-    print(header)
-    print("-" * 60)
-
-    baseline = results["agents"].get("baseline", {}).get("totals", {})
-    contexthub = results["agents"].get("contexthub", {}).get("totals", {})
-
-    metrics = [
-        ("Metric Selection", "metric_selection"),
-        ("Source Selection", "source_selection"),
-        ("SQL Correctness", "sql_correctness"),
-        ("Groundedness", "groundedness"),
-        ("Tool Success", "tool_success"),
-    ]
-
-    for display_name, key in metrics:
-        b_val = baseline.get(key, 0)
-        c_val = contexthub.get(key, 0)
-        delta = c_val - b_val
-        delta_str = f"+{delta:.2%}" if delta > 0 else f"{delta:.2%}"
-        print(f"{display_name:<25} {b_val:>11.1%} {c_val:>11.1%} {delta_str:>8}")
-
-    print("-" * 60)
-
-    # Overall average
-    b_avg = sum(baseline.values()) / len(baseline) if baseline else 0
-    c_avg = sum(contexthub.values()) / len(contexthub) if contexthub else 0
-    delta = c_avg - b_avg
-    delta_str = f"+{delta:.2%}" if delta > 0 else f"{delta:.2%}"
-    print(f"{'Overall Average':<25} {b_avg:>11.1%} {c_avg:>11.1%} {delta_str:>8}")
-
-    print(f"\n{'Latency & Tool Usage':<25}")
-    print("-" * 60)
-
-    b_latency = results["agents"].get("baseline", {}).get("avg_latency", 0)
-    c_latency = results["agents"].get("contexthub", {}).get("avg_latency", 0)
-    b_tools = results["agents"].get("baseline", {}).get("total_tool_calls", 0)
-    c_tools = results["agents"].get("contexthub", {}).get("total_tool_calls", 0)
-    b_errors = results["agents"].get("baseline", {}).get("errors", 0)
-    c_errors = results["agents"].get("contexthub", {}).get("errors", 0)
-
-    print(f"{'Avg Latency (s)':<25} {b_latency:>12.1f} {c_latency:>12.1f}")
-    print(f"{'Total Tool Calls':<25} {b_tools:>12} {c_tools:>12}")
-    print(f"{'Errors':<25} {b_errors:>12} {c_errors:>12}")
+    """Print a formatted comparison table (ASCII only, safe on Windows consoles)."""
+    agents = results["agents"]
+    names = list(agents)
+    width = 18
+    print(f"\n{'='*(26 + width * len(names))}")
+    print("  EVALUATION RESULTS")
+    print(f"{'='*(26 + width * len(names))}\n")
+    print(f"{'Metric':<26}" + "".join(f"{n:>{width}}" for n in names))
+    print("-" * (26 + width * len(names)))
+    for dim in DIMENSIONS:
+        row = f"{dim:<26}"
+        for n in names:
+            row += f"{_pct(agents[n]['totals'][dim], agents[n].get('totals_std', {}).get(dim)):>{width}}"
+        print(row)
+    print("-" * (26 + width * len(names)))
+    print(f"{'Overall average':<26}" + "".join(f"{_pct(overall(agents[n]['totals'])):>{width}}" for n in names))
+    print(f"{'Avg latency (s)':<26}" + "".join(f"{agents[n]['avg_latency']:>{width}.1f}" for n in names))
+    print(f"{'Tool calls (per run)':<26}" + "".join(f"{agents[n]['total_tool_calls']:>{width}}" for n in names))
+    print(f"{'Errors':<26}" + "".join(f"{agents[n]['errors']:>{width}}" for n in names))
     print()
 
 
@@ -428,23 +503,21 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="Run ContextEngine evaluation")
-    parser.add_argument("--agent", choices=["baseline", "contexthub", "both"], default="both")
+    parser.add_argument("--agent", choices=list(AGENT_CHOICES), default="all")
     parser.add_argument("--questions", type=int, default=None, help="Limit number of questions")
-    parser.add_argument("--verbose", action="store_true", default=True)
+    parser.add_argument("--runs", type=int, default=1, help="Repeat each agent N times (reports mean +/- std)")
+    parser.add_argument("--delay", type=float, default=2.0, help="Seconds between questions (rate limits)")
     parser.add_argument("--quiet", action="store_true")
 
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=logging.INFO if not args.quiet else logging.WARNING,
+        level=logging.WARNING if args.quiet else logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
 
-    run_evaluation(
-        agent_type=args.agent,
-        limit=args.questions,
-        verbose=not args.quiet,
-    )
+    run_evaluation(agent_type=args.agent, limit=args.questions, verbose=not args.quiet,
+                   runs=args.runs, delay=args.delay)
 
 
 if __name__ == "__main__":

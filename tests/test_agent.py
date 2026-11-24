@@ -413,3 +413,97 @@ class TestEvaluationScoring:
         response = {"answer": "I think maybe it's around some amount.", "tool_calls": []}
         score = score_groundedness(response, {})
         assert score < 0.5
+
+
+class TestFairScoring:
+    """The v2 scorers: execution accuracy and removal of context-only bonuses."""
+
+    def test_results_match_order_and_column_insensitive(self):
+        from evaluation.runner import results_match
+        gold = [{"category": "AI/ML", "sum": 10.0}, {"category": "Data", "sum": 5.0}]
+        pred = [{"cat": "Data", "revenue": 5.0}, {"cat": "AI/ML", "revenue": 10.0, "orders": 3}]
+        assert results_match(gold, pred) is True
+
+    def test_results_match_rejects_wrong_number(self):
+        from evaluation.runner import results_match
+        assert results_match([{"v": 291657723.14}], [{"v": 432045530.44}]) is False
+
+    def test_results_match_percentage_or_fraction(self):
+        from evaluation.runner import results_match
+        assert results_match([{"rate": 7.557}], [{"rate": 0.07557}]) is True
+        assert results_match([{"rate": 7.557}], [{"rate": 7.56}]) is True
+
+    def test_results_match_month_label_prefix(self):
+        from evaluation.runner import results_match
+        assert results_match([{"m": "2026-06", "v": 1.0}], [{"month": "2026-06-01 00:00:00", "v": 1.0}]) is True
+
+    def test_execution_accuracy_uses_executor(self):
+        from evaluation.runner import score_execution_accuracy
+        results = {"GOLD": {"rows": [{"v": 100}]}, "RIGHT": {"rows": [{"x": 100}]}, "WRONG": {"rows": [{"x": 150}]}}
+        expected = {"gold_sql": "GOLD"}
+
+        def response(query):
+            return {"tool_calls": [{"tool": "execute_sql", "args": {"query": query}}]}
+
+        assert score_execution_accuracy(response("RIGHT"), expected, results.__getitem__) == 1.0
+        assert score_execution_accuracy(response("WRONG"), expected, results.__getitem__) == 0.0
+        assert score_execution_accuracy(response("RIGHT"), {"gold_sql": None}, results.__getitem__) is None
+
+    def test_metric_selection_credits_correct_sql_without_metric_name(self):
+        """A baseline that writes the right SQL gets full credit, even though it
+        has never heard of 'net_revenue'."""
+        from evaluation.runner import score_metric_selection
+        expected = {"expected_metric": "net_revenue", "expected_source_table": "business.orders",
+                    "expected_source_column": "net_amount", "expected_filter": "status = 'completed'"}
+        response = {"answer": "Revenue was 30,552,981.27", "tool_calls": [{"tool": "execute_sql", "args": {
+            "query": "SELECT SUM(net_amount) FROM business.orders WHERE status='completed'"}}]}
+        assert score_metric_selection(response, expected) == 1.0
+
+    def test_no_bonus_for_just_calling_get_definition(self):
+        from evaluation.runner import score_metric_selection
+        expected = {"expected_metric": "net_revenue", "expected_source_column": "net_amount"}
+        response = {"answer": "It is about 43 crore.", "tool_calls": [
+            {"tool": "get_definition", "args": {"metric_name": "net_revenue"}}]}
+        assert score_metric_selection(response, expected) == 0.0
+
+    def test_groundedness_does_not_reward_trust_words(self):
+        from evaluation.runner import score_groundedness
+        base = {"answer": "Revenue was 100 from the orders table.", "tool_calls": [
+            {"tool": "execute_sql", "args": {}, "result_preview": '{"rows": [{"v": "100"}], "row_count": 1}'}]}
+        with_trust = {**base, "answer": base["answer"] + " This metric is certified."}
+        assert score_groundedness(base, {}) == score_groundedness(with_trust, {}) == 1.0
+
+    def test_groundedness_checks_number_matches_result(self):
+        from evaluation.runner import score_groundedness
+        response = {"answer": "Revenue was 999 from the orders table.", "tool_calls": [
+            {"tool": "execute_sql", "args": {}, "result_preview": '{"rows": [{"v": "100"}], "row_count": 1}'}]}
+        assert score_groundedness(response, {}) < 1.0
+
+    def test_groundedness_understands_crore(self):
+        from evaluation.runner import score_groundedness
+        response = {"answer": "Net revenue was 3.06 crore (orders table).", "tool_calls": [
+            {"tool": "execute_sql", "args": {}, "result_preview": '{"rows": [{"v": "30552981.27"}]}'}]}
+        assert score_groundedness(response, {}) == 1.0
+
+    def test_trust_awareness_only_applies_when_expected(self):
+        from evaluation.runner import score_trust_awareness
+        assert score_trust_awareness({"answer": "x"}, {"expects_warning": False}) is None
+        assert score_trust_awareness({"answer": "gross_revenue is deprecated"}, {"expects_warning": True}) == 1.0
+        assert score_trust_awareness({"answer": "It is 43 crore"}, {"expects_warning": True}) == 0.0
+
+    def test_sql_correctness_ignores_table_aliases(self):
+        from evaluation.runner import score_sql_correctness
+        expected = {"expected_filter": "status = 'completed' AND customers.segment = 'enterprise'"}
+        response = {"tool_calls": [{"tool": "execute_sql", "args": {
+            "query": "SELECT SUM(o.net_amount) FROM business.orders o JOIN business.customers c ON c.id = o.customer_id "
+                     "WHERE o.status = 'completed' AND c.segment = 'enterprise'"}}]}
+        assert score_sql_correctness(response, expected) == 1.0
+
+    def test_dataset_is_consistent(self):
+        from evaluation.runner import load_dataset
+        questions = load_dataset()
+        assert len(questions) == 25
+        assert len({q["id"] for q in questions}) == 25
+        assert sum(1 for q in questions if q["gold_sql"]) >= 15
+        for q in questions:
+            assert {"gold_sql", "expects_warning", "expected_metric"} <= q.keys()

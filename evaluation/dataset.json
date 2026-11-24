@@ -1,6 +1,6 @@
 {
   "description": "ContextEngine evaluation benchmark - tests whether structured business context improves AI agent reliability",
-  "version": "1.0",
+  "version": "2.0",
   "questions": [
     {
       "id": "q01",
@@ -11,7 +11,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "net_amount",
       "expected_filter": "status = 'completed'",
-      "notes": "The agent must choose net_revenue (certified) over gross_revenue (deprecated). Must also filter for completed orders only."
+      "notes": "The agent must choose net_revenue (certified) over gross_revenue (deprecated). Must also filter for completed orders only.",
+      "gold_sql": "SELECT SUM(net_amount) FROM business.orders WHERE status = 'completed' AND order_date >= date_trunc('month', CURRENT_DATE) - INTERVAL '1 month' AND order_date < date_trunc('month', CURRENT_DATE)",
+      "expects_warning": false
     },
     {
       "id": "q02",
@@ -22,7 +24,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "net_amount",
       "expected_filter": "status = 'completed'",
-      "notes": "Word 'total' might trick baseline into using total_amount. ContextEngine should still use net_revenue definition."
+      "notes": "Word 'total' might trick baseline into using total_amount. ContextEngine should still use net_revenue definition.",
+      "gold_sql": "SELECT SUM(net_amount) FROM business.orders WHERE status = 'completed' AND order_date >= '2026-07-01' AND order_date < '2026-08-01'",
+      "expects_warning": false
     },
     {
       "id": "q03",
@@ -33,7 +37,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "net_amount",
       "expected_filter": null,
-      "notes": "Agent should identify net_revenue as certified and explain why gross_revenue is deprecated."
+      "notes": "Agent should identify net_revenue as certified and explain why gross_revenue is deprecated.",
+      "gold_sql": null,
+      "expects_warning": false
     },
     {
       "id": "q04",
@@ -44,7 +50,9 @@
       "expected_source_table": "business.customers",
       "expected_source_column": "id",
       "expected_filter": "is_active = true AND last_order_date >= CURRENT_DATE - INTERVAL '90 days'",
-      "notes": "Baseline might just count WHERE is_active = true. ContextEngine should also apply the 90-day recency rule."
+      "notes": "Baseline might just count WHERE is_active = true. ContextEngine should also apply the 90-day recency rule.",
+      "gold_sql": "SELECT COUNT(DISTINCT id) FROM business.customers WHERE is_active = true AND last_order_date >= CURRENT_DATE - INTERVAL '90 days'",
+      "expects_warning": false
     },
     {
       "id": "q05",
@@ -55,7 +63,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "net_amount",
       "expected_filter": "status = 'completed'",
-      "notes": "Must use net_amount (not total_amount) and filter for completed orders."
+      "notes": "Must use net_amount (not total_amount) and filter for completed orders.",
+      "gold_sql": "SELECT AVG(net_amount) FROM business.orders WHERE status = 'completed'",
+      "expects_warning": false
     },
     {
       "id": "q06",
@@ -66,7 +76,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "total_amount",
       "expected_filter": null,
-      "notes": "Even though asked for gross_revenue, ContextEngine should warn it's deprecated and suggest net_revenue instead."
+      "notes": "Even though asked for gross_revenue, ContextEngine should warn it's deprecated and suggest net_revenue instead.",
+      "gold_sql": "SELECT SUM(total_amount) FROM business.orders",
+      "expects_warning": true
     },
     {
       "id": "q07",
@@ -77,7 +89,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "total_amount",
       "expected_filter": null,
-      "notes": "Agent should identify gross_revenue as deprecated."
+      "notes": "Agent should identify gross_revenue as deprecated.",
+      "gold_sql": null,
+      "expects_warning": true
     },
     {
       "id": "q08",
@@ -88,7 +102,9 @@
       "expected_source_table": "business.customers",
       "expected_source_column": "id",
       "expected_filter": null,
-      "notes": "Simple count of all customers, regardless of active status."
+      "notes": "Simple count of all customers, regardless of active status.",
+      "gold_sql": "SELECT COUNT(*) FROM business.customers",
+      "expects_warning": false
     },
     {
       "id": "q09",
@@ -99,7 +115,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "status",
       "expected_filter": "status IN ('completed', 'refunded')",
-      "notes": "Refunded / (Completed + Refunded). Should not include cancelled or pending orders in denominator."
+      "notes": "Refunded / (Completed + Refunded). Should not include cancelled or pending orders in denominator.",
+      "gold_sql": "SELECT 100.0 * COUNT(*) FILTER (WHERE status = 'refunded') / COUNT(*) FROM business.orders WHERE status IN ('completed', 'refunded')",
+      "expects_warning": false
     },
     {
       "id": "q10",
@@ -110,7 +128,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "net_amount",
       "expected_filter": "status = 'completed' AND customers.segment = 'enterprise'",
-      "notes": "Must use net_revenue definition (certified) with customer segment join. Requires understanding both metric definition and table relationships."
+      "notes": "Must use net_revenue definition (certified) with customer segment join. Requires understanding both metric definition and table relationships.",
+      "gold_sql": "SELECT SUM(o.net_amount) FROM business.orders o JOIN business.customers c ON c.id = o.customer_id WHERE o.status = 'completed' AND c.segment = 'enterprise' AND o.order_date >= make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE) >= 7 THEN 0 ELSE 1 END, 7, 1) AND o.order_date < make_date(EXTRACT(YEAR FROM CURRENT_DATE)::int - CASE WHEN EXTRACT(MONTH FROM CURRENT_DATE) >= 7 THEN 0 ELSE 1 END, 7, 1) + INTERVAL '1 month'",
+      "expects_warning": false
     },
     {
       "id": "q11",
@@ -121,7 +141,9 @@
       "expected_source_table": "business.payments",
       "expected_source_column": null,
       "expected_filter": null,
-      "notes": "Agent should identify payments table and describe its structure."
+      "notes": "Agent should identify payments table and describe its structure.",
+      "gold_sql": null,
+      "expects_warning": false
     },
     {
       "id": "q12",
@@ -132,7 +154,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "total_amount",
       "expected_filter": null,
-      "notes": "ContextEngine should explain it's the pre-adjustment amount and warn it's NOT revenue. Should reference business context."
+      "notes": "ContextEngine should explain it's the pre-adjustment amount and warn it's NOT revenue. Should reference business context.",
+      "gold_sql": null,
+      "expects_warning": false
     },
     {
       "id": "q13",
@@ -143,7 +167,9 @@
       "expected_source_table": null,
       "expected_source_column": null,
       "expected_filter": null,
-      "notes": "Agent should explain the FK relationship: payments.order_id → orders.id, one payment per order."
+      "notes": "Agent should explain the FK relationship: payments.order_id → orders.id, one payment per order.",
+      "gold_sql": null,
+      "expects_warning": false
     },
     {
       "id": "q14",
@@ -154,7 +180,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "status",
       "expected_filter": "status != 'pending'",
-      "notes": "Completed / (all non-pending). Must exclude pending orders from denominator."
+      "notes": "Completed / (all non-pending). Must exclude pending orders from denominator.",
+      "gold_sql": "SELECT 100.0 * COUNT(*) FILTER (WHERE status = 'completed') / COUNT(*) FROM business.orders WHERE status != 'pending'",
+      "expects_warning": false
     },
     {
       "id": "q15",
@@ -165,7 +193,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "net_amount",
       "expected_filter": "status = 'completed'",
-      "notes": "Must use net_revenue, join to products table, group by category. Tests multi-table understanding."
+      "notes": "Must use net_revenue, join to products table, group by category. Tests multi-table understanding.",
+      "gold_sql": "SELECT p.category, SUM(o.net_amount) FROM business.orders o JOIN business.products p ON p.id = o.product_id WHERE o.status = 'completed' AND o.order_date >= '2026-07-01' AND o.order_date < '2026-08-01' GROUP BY p.category",
+      "expects_warning": false
     },
     {
       "id": "q16",
@@ -176,7 +206,9 @@
       "expected_source_table": null,
       "expected_source_column": null,
       "expected_filter": null,
-      "notes": "Agent should identify MRR as a draft/stale metric that is not ready for use."
+      "notes": "Agent should identify MRR as a draft/stale metric that is not ready for use.",
+      "gold_sql": null,
+      "expects_warning": true
     },
     {
       "id": "q17",
@@ -187,7 +219,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "net_amount",
       "expected_filter": "status = 'completed'",
-      "notes": "Must use net_amount for completed orders, joined to products, ordered by sum descending with LIMIT 5."
+      "notes": "Must use net_amount for completed orders, joined to products, ordered by sum descending with LIMIT 5.",
+      "gold_sql": "SELECT p.name, SUM(o.net_amount) AS revenue FROM business.orders o JOIN business.products p ON p.id = o.product_id WHERE o.status = 'completed' GROUP BY p.name ORDER BY revenue DESC LIMIT 5",
+      "expects_warning": false
     },
     {
       "id": "q18",
@@ -198,7 +232,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "status",
       "expected_filter": "status = 'cancelled'",
-      "notes": "Simple count with status filter. Both agents should get this right."
+      "notes": "Simple count with status filter. Both agents should get this right.",
+      "gold_sql": "SELECT COUNT(*) FROM business.orders WHERE status = 'cancelled'",
+      "expects_warning": false
     },
     {
       "id": "q19",
@@ -209,7 +245,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": null,
       "expected_filter": null,
-      "notes": "ContextEngine should explain the full calculation: net = total - discount - refund + tax. And note that net_amount is the certified revenue column."
+      "notes": "ContextEngine should explain the full calculation: net = total - discount - refund + tax. And note that net_amount is the certified revenue column.",
+      "gold_sql": null,
+      "expects_warning": false
     },
     {
       "id": "q20",
@@ -220,7 +258,9 @@
       "expected_source_table": "business.payments",
       "expected_source_column": "method",
       "expected_filter": "status = 'completed'",
-      "notes": "Group by payment method, count completed payments. Both agents should handle this."
+      "notes": "Group by payment method, count completed payments. Both agents should handle this.",
+      "gold_sql": "SELECT method, COUNT(*) FROM business.payments WHERE status = 'completed' GROUP BY method",
+      "expects_warning": false
     },
     {
       "id": "q21",
@@ -231,7 +271,9 @@
       "expected_source_table": null,
       "expected_source_column": null,
       "expected_filter": null,
-      "notes": "Should return Finance Team as owner of net_revenue."
+      "notes": "Should return Finance Team as owner of net_revenue.",
+      "gold_sql": null,
+      "expects_warning": false
     },
     {
       "id": "q22",
@@ -241,8 +283,10 @@
       "expected_metric": "recognized_revenue",
       "expected_source_table": "business.payments",
       "expected_source_column": "amount",
-      "expected_filter": "status = 'completed'",
-      "notes": "Should identify payments.amount as source and note it's experimental status."
+      "expected_filter": null,
+      "notes": "Should identify payments.amount as source and note it's experimental status.",
+      "gold_sql": null,
+      "expects_warning": true
     },
     {
       "id": "q23",
@@ -253,7 +297,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "net_amount",
       "expected_filter": "status = 'completed'",
-      "notes": "Must use net_revenue for both months. Tests temporal comparison with correct metric."
+      "notes": "Must use net_revenue for both months. Tests temporal comparison with correct metric.",
+      "gold_sql": "SELECT TO_CHAR(order_date, 'YYYY-MM'), SUM(net_amount) FROM business.orders WHERE status = 'completed' AND order_date >= '2026-06-01' AND order_date < '2026-08-01' GROUP BY 1",
+      "expects_warning": false
     },
     {
       "id": "q24",
@@ -264,7 +310,9 @@
       "expected_source_table": "business.customers",
       "expected_source_column": "is_active",
       "expected_filter": null,
-      "notes": "ContextEngine should warn that is_active alone is unreliable and explain the certified definition requires 90-day recency."
+      "notes": "ContextEngine should warn that is_active alone is unreliable and explain the certified definition requires 90-day recency.",
+      "gold_sql": null,
+      "expects_warning": true
     },
     {
       "id": "q25",
@@ -275,7 +323,9 @@
       "expected_source_table": "business.orders",
       "expected_source_column": "net_amount",
       "expected_filter": "status = 'completed'",
-      "notes": "Must use net_revenue, join customers, group by segment. Tests multi-table understanding with correct metric."
+      "notes": "Must use net_revenue, join customers, group by segment. Tests multi-table understanding with correct metric.",
+      "gold_sql": "SELECT c.segment, SUM(o.net_amount) FROM business.orders o JOIN business.customers c ON c.id = o.customer_id WHERE o.status = 'completed' GROUP BY c.segment",
+      "expects_warning": false
     }
   ]
 }
