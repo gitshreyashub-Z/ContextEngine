@@ -5,7 +5,6 @@ pydantic>=2.9.0
 pydantic-settings>=2.5.0
 sqlalchemy>=2.0.35
 psycopg2-binary>=2.9.9
-alembic>=1.13.0
 
 # LLM & Agent
 langchain>=0.3.0
@@ -13,6 +12,7 @@ langchain-core>=0.3.0
 langchain-google-genai>=2.0.0
 langchain-groq>=0.2.0
 langchain-ollama>=0.2.0
+langchain-openai>=0.2.0  # OpenRouter (OpenAI-compatible API)
 langgraph>=0.2.0
 
 # MCP
