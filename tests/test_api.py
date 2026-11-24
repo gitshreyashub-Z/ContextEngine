@@ -33,15 +33,18 @@ def test_missing_question_is_422():
     assert client.post("/ask", json={"agent": "contexthub"}).status_code == 422
 
 
+@pytest.mark.db
 def test_metrics():
     assert client.get("/metrics").json()["count"] >= 9
 
 
+@pytest.mark.db
 def test_schema_found_and_not_found():
     assert client.get("/schema/orders").status_code == 200
     assert client.get("/schema/nope").status_code == 404
 
 
+@pytest.mark.db
 @pytest.mark.parametrize("question", ["How many active customers do we have?", "What is our refund rate?"])
 def test_ask_pipeline_returns_sources(question):
     body = client.post("/ask", json={"question": question, "agent": "contexthub"}).json()
@@ -50,6 +53,7 @@ def test_ask_pipeline_returns_sources(question):
     assert any(c["tool"] == "execute_sql" for c in body["tool_calls"])
 
 
+@pytest.mark.db
 def test_concurrent_requests():
     """Endpoints run in a threadpool; the context service must be safe to use concurrently."""
     questions = ["What is our average order value?", "What is our refund rate?",

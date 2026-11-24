@@ -11,6 +11,8 @@ import pytest
 
 from app.context.service import ContextService
 
+pytestmark = pytest.mark.db
+
 
 @pytest.fixture
 def context_service():

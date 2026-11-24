@@ -100,6 +100,7 @@ class TestSQLValidation:
         assert is_safe is True
 
 
+@pytest.mark.db
 class TestContextTools:
     """Test the ContextTools class methods."""
 
