@@ -24,14 +24,20 @@ app = FastAPI(
     version="1.0.0",
 )
 
-# CORS - allow frontend to call backend
+# CORS - allow frontend to call backend.
+# The frontend sends no cookies/auth, so credentials are disabled; a wildcard origin
+# combined with credentials would let any website make authenticated calls.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+# Note: endpoints that call the agents or the database are plain `def`, not `async def`.
+# The LLM and SQLAlchemy calls are blocking; FastAPI runs `def` endpoints in a threadpool,
+# whereas blocking inside `async def` would freeze the event loop for all requests.
 
 
 # --- Request/Response Models ---
@@ -78,7 +84,7 @@ async def health_check():
 
 
 @app.post("/ask", response_model=AskResponse)
-async def ask_question(request: AskRequest):
+def ask_question(request: AskRequest):
     """Ask a question to the AI agent.
 
     The ContextEngine agent will:
@@ -129,7 +135,7 @@ async def ask_question(request: AskRequest):
 
 
 @app.get("/metrics")
-async def list_available_metrics():
+def list_available_metrics():
     """List all available business metrics and their status."""
     from app.mcp.tools import ContextTools
 
@@ -139,7 +145,7 @@ async def list_available_metrics():
 
 
 @app.get("/schema/{table_name}")
-async def get_table_schema(table_name: str):
+def get_table_schema(table_name: str):
     """Get schema information for a table."""
     from app.mcp.tools import ContextTools
 
