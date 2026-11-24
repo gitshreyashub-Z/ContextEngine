@@ -64,6 +64,108 @@ class TestAgentInterface:
         assert "execute_sql" in tool_names
         assert len(tool_names) == 1  # Only SQL execution
 
+    def test_contexthub_react_has_all_tools(self):
+        """The ReAct ContextEngine agent gets all 7 tools."""
+        from app.agent.contexthub_react import CONTEXTHUB_TOOLS, ContextEngineReActAgent
+        names = {t.name for t in CONTEXTHUB_TOOLS}
+        assert names == {"search_assets", "get_definition", "get_trust_signal", "get_schema",
+                         "get_lineage", "execute_sql", "list_metrics"}
+        assert ContextEngineReActAgent().name == "contexthub_react"
+
+    def test_react_prompts_differ_only_by_context_instructions(self):
+        """Fair ablation: the context prompt is the baseline prompt plus tool instructions."""
+        from app.agent.prompts import CONTEXTENGINE_REACT_SYSTEM_PROMPT
+        assert CONTEXTENGINE_REACT_SYSTEM_PROMPT.startswith(BASELINE_SYSTEM_PROMPT)
+
+    def test_context_prompt_does_not_leak_answers(self):
+        """Answers must come from the tools, not the prompt."""
+        from app.agent.prompts import CONTEXTENGINE_REACT_SYSTEM_PROMPT as p
+        for leak in ("net_revenue", "gross_revenue", "90 days", "status = 'completed'", "net_amount for"):
+            assert leak not in p
+
+
+class FakeLLM:
+    """Scripted stand-in for a chat model: returns the given AIMessages in order."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def bind_tools(self, tools):
+        return self
+
+    def invoke(self, messages):
+        self.calls.append(list(messages))
+        return self.responses.pop(0)
+
+
+def _ai_tool_call(name, args, call_id="call_1"):
+    from langchain_core.messages import AIMessage
+    return AIMessage(content="", tool_calls=[{"name": name, "args": args, "id": call_id}])
+
+
+class TestReActLoop:
+    """The shared LangGraph loop, driven by a fake LLM (no API key needed)."""
+
+    def test_keeps_conversation_history(self):
+        """Regression: nodes used to replace `messages`, so after a tool call the LLM saw only
+        the tool result - no system prompt, no question."""
+        from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+        from app.agent import react, tools
+        from app.agent.baseline import BaselineAgent
+
+        fake = FakeLLM([_ai_tool_call("execute_sql", {"query": "SELECT 1"}), AIMessage(content="The answer is 1.")])
+        with patch.object(react, "get_llm", return_value=fake), \
+             patch.object(tools._tools, "execute_sql", return_value={"rows": [{"n": 1}], "query": "SELECT 1"}):
+            response = BaselineAgent().ask("What is one?")
+
+        assert response["success"] is True
+        assert response["answer"] == "The answer is 1."
+        assert [c["tool"] for c in response["tool_calls"]] == ["execute_sql"]
+        second_call = fake.calls[1]
+        assert [type(m) for m in second_call] == [SystemMessage, HumanMessage, AIMessage, ToolMessage]
+
+    def test_unknown_tool_returns_error_to_llm(self):
+        from langchain_core.messages import AIMessage
+        from app.agent import react
+        from app.agent.baseline import BaselineAgent
+
+        fake = FakeLLM([_ai_tool_call("get_definition", {"metric_name": "x"}), AIMessage(content="ok")])
+        with patch.object(react, "get_llm", return_value=fake):
+            response = BaselineAgent().ask("q")
+        assert "Unknown tool" in response["tool_calls"][0]["result_preview"]
+
+    def test_recursion_limit_is_reported(self):
+        from app.agent import react
+        from app.agent.baseline import BaselineAgent
+
+        endless = FakeLLM([_ai_tool_call("execute_sql", {"query": "SELECT 1"}, f"c{i}") for i in range(50)])
+        with patch.object(react, "get_llm", return_value=endless), \
+             patch.object(react.logger, "error"):
+            from app.agent import tools
+            with patch.object(tools._tools, "execute_sql", return_value={"rows": []}):
+                response = BaselineAgent().ask("q")
+        assert response["success"] is False
+        assert response["error"] == "recursion_limit"
+
+    def test_sources_extracted_from_context_tools(self):
+        from langchain_core.messages import AIMessage
+        from app.agent import react, tools
+        from app.agent.contexthub_react import ContextEngineReActAgent
+
+        fake = FakeLLM([
+            _ai_tool_call("get_definition", {"metric_name": "net_revenue"}),
+            _ai_tool_call("get_trust_signal", {"asset_name": "net_revenue"}, "call_2"),
+            AIMessage(content="done"),
+        ])
+        with patch.object(react, "get_llm", return_value=fake), \
+             patch.object(tools._tools, "get_definition", return_value=NET_REVENUE), \
+             patch.object(tools._tools, "get_trust_signal",
+                          return_value={"asset_name": "net_revenue", "trust_level": "certified"}):
+            response = ContextEngineReActAgent().ask("revenue?")
+        assert {"type": "trust_signal", "asset": "net_revenue", "level": "certified"} in response["sources"]
+        assert response["sources"][0]["source"] == "business.orders.net_amount"
+
 
 
 NET_REVENUE = {
