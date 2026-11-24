@@ -70,6 +70,35 @@ class TestSQLValidation:
         is_safe, msg = validate_sql("SELECT * FROM business.orders -- DROP TABLE orders")
         assert is_safe is False
 
+    def test_stacked_statements_rejected(self):
+        """Anything after a semicolon is rejected."""
+        is_safe, _ = validate_sql("SELECT 1; SELECT pg_terminate_backend(1)")
+        assert is_safe is False
+
+    def test_trailing_semicolon_allowed(self):
+        """A single trailing semicolon is fine."""
+        is_safe, _ = validate_sql("SELECT COUNT(*) FROM business.orders;")
+        assert is_safe is True
+
+    def test_select_into_rejected(self):
+        """SELECT ... INTO creates a table and must be rejected."""
+        is_safe, _ = validate_sql("SELECT * INTO business.copy FROM business.orders")
+        assert is_safe is False
+
+    def test_pg_sleep_rejected(self):
+        """pg_sleep can be used for denial of service."""
+        is_safe, _ = validate_sql("SELECT pg_sleep(600)")
+        assert is_safe is False
+
+    def test_block_comment_rejected(self):
+        is_safe, _ = validate_sql("SELECT /* hidden */ 1")
+        assert is_safe is False
+
+    def test_column_names_containing_keywords_allowed(self):
+        """Word boundaries: created_at / updated_at must not trip CREATE / UPDATE."""
+        is_safe, _ = validate_sql("SELECT created_at FROM business.customers")
+        assert is_safe is True
+
 
 class TestContextTools:
     """Test the ContextTools class methods."""

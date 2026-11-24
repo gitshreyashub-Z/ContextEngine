@@ -18,7 +18,9 @@ from app.context.service import ContextService
 from app.db.connection import get_engine
 
 
-# SQL safety patterns
+MAX_ROWS = 100
+
+# SQL safety patterns (a first line of defence; the read-only DB role is the guarantee)
 DANGEROUS_SQL_PATTERNS = [
     r"\bDROP\b",
     r"\bDELETE\b",
@@ -31,9 +33,20 @@ DANGEROUS_SQL_PATTERNS = [
     r"\bREVOKE\b",
     r"\bEXEC\b",
     r"\bEXECUTE\b",
+    r"\bCOPY\b",
+    r"\bINTO\b",  # SELECT ... INTO creates a table
+    r"\bPG_SLEEP\b",  # Denial of service
+    r"\bPG_READ_FILE\b",
+    r"\bPG_READ_BINARY_FILE\b",
+    r"\bLO_IMPORT\b",
     r"--",
-    r";.*;\s*$",  # Multiple statements
+    r"/\*",  # Block comments can hide payloads
+    r";\s*\S",  # Multiple statements: anything after a semicolon
 ]
+
+# A LIMIT clause at the very end of the query (an inner LIMIT in a CTE or
+# subquery does not limit the outer result set).
+_TRAILING_LIMIT = re.compile(r"\bLIMIT\s+\d+\s*;?\s*$", re.IGNORECASE)
 
 
 def validate_sql(query: str) -> tuple[bool, str]:
@@ -220,17 +233,18 @@ class ContextTools:
                 "elapsed_ms": round((time.time() - start) * 1000, 2),
             }
 
-        # Add LIMIT if not present to prevent huge result sets
-        normalized = query.strip().upper()
-        if "LIMIT" not in normalized:
-            query = query.rstrip(";") + " LIMIT 100"
+        # Add LIMIT if the outer query has none, to prevent huge result sets
+        query = query.strip().rstrip(";").strip()
+        if not _TRAILING_LIMIT.search(query):
+            query = f"{query} LIMIT {MAX_ROWS}"
 
         try:
             engine = get_engine(readonly=True)
             with engine.connect() as conn:
                 result = conn.execute(text(query))
                 columns = list(result.keys())
-                rows = [dict(zip(columns, row)) for row in result.fetchall()]
+                # Hard cap even if the query asked for a larger LIMIT
+                rows = [dict(zip(columns, row)) for row in result.fetchmany(MAX_ROWS)]
                 elapsed = time.time() - start
 
                 return {
