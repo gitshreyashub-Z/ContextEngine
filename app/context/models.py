@@ -5,7 +5,6 @@ from datetime import datetime
 
 from sqlalchemy import (
     DateTime,
-    Enum,
     ForeignKey,
     Integer,
     String,
@@ -14,7 +13,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
-from app.db.connection import Base
+from app.db.connection import Base, pg_enum
 
 
 class AssetType(str, enum.Enum):
@@ -49,7 +48,7 @@ class Asset(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    asset_type: Mapped[AssetType] = mapped_column(Enum(AssetType), nullable=False)
+    asset_type: Mapped[AssetType] = mapped_column(pg_enum(AssetType), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False)
     owner: Mapped[str] = mapped_column(String(255), nullable=False)
     schema_name: Mapped[str] = mapped_column(String(100), default="business")
@@ -74,7 +73,7 @@ class BusinessDefinition(Base):
     source_column: Mapped[str] = mapped_column(String(255), nullable=False)
     filter_condition: Mapped[str | None] = mapped_column(Text)
     owner: Mapped[str] = mapped_column(String(255), nullable=False)
-    status: Mapped[MetricStatus] = mapped_column(Enum(MetricStatus), nullable=False)
+    status: Mapped[MetricStatus] = mapped_column(pg_enum(MetricStatus), nullable=False)
     examples: Mapped[str | None] = mapped_column(Text)
     notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
@@ -89,7 +88,7 @@ class TrustSignal(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     asset_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
-    trust_level: Mapped[TrustLevel] = mapped_column(Enum(TrustLevel), nullable=False)
+    trust_level: Mapped[TrustLevel] = mapped_column(pg_enum(TrustLevel), nullable=False)
     reason: Mapped[str] = mapped_column(Text, nullable=False)
     certified_by: Mapped[str | None] = mapped_column(String(255))
     last_validated: Mapped[datetime | None] = mapped_column(DateTime)

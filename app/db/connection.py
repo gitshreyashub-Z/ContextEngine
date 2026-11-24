@@ -1,8 +1,9 @@
 """Database connection management."""
 
+import enum
 from functools import lru_cache
 
-from sqlalchemy import create_engine
+from sqlalchemy import Enum, create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import get_settings
@@ -13,6 +14,16 @@ READONLY_STATEMENT_TIMEOUT_MS = 10_000
 
 class Base(DeclarativeBase):
     pass
+
+
+def pg_enum(enum_cls: type[enum.Enum]) -> Enum:
+    """Enum column type that stores the enum *values* ('completed'), not names ('COMPLETED').
+
+    SQLAlchemy's default is to store member names. Business definitions, benchmark filters
+    and LLM-written SQL all use lowercase values (status = 'completed'), which failed with
+    "invalid input value for enum" against name-based enums.
+    """
+    return Enum(enum_cls, values_callable=lambda members: [m.value for m in members])
 
 
 def _with_driver(url: str) -> str:

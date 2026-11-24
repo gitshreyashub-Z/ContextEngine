@@ -161,6 +161,24 @@ class TestContextTools:
         result = tools.execute_sql("SELECT * FROM business.customers")
         assert "LIMIT" in result.get("query", "")
 
+    def test_every_definition_filter_executes(self, tools):
+        """Each definition's filter_condition must be valid SQL against the real data.
+
+        Regression: enums used to be stored by name ('COMPLETED'), so the certified
+        filter status = 'completed' failed with 'invalid input value for enum'.
+        """
+        for metric in tools.list_metrics()["metrics"]:
+            defn = tools.get_definition(metric["metric_name"])
+            where = f" WHERE {defn['filter_condition']}" if defn["filter_condition"] else ""
+            result = tools.execute_sql(f"SELECT COUNT(*) AS n FROM {defn['source_table']}{where}")
+            assert "error" not in result, (metric["metric_name"], result.get("error"))
+
+    def test_certified_revenue_differs_from_gross(self, tools):
+        """The core trap: certified net revenue is lower than SUM(total_amount)."""
+        net = tools.execute_sql("SELECT SUM(net_amount) AS v FROM business.orders WHERE status = 'completed'")
+        gross = tools.execute_sql("SELECT SUM(total_amount) AS v FROM business.orders")
+        assert 0 < net["rows"][0]["v"] < gross["rows"][0]["v"]
+
     def test_list_metrics(self, tools):
         """list_metrics should return all metrics."""
         result = tools.list_metrics()

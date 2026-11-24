@@ -8,7 +8,6 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
-    Enum,
     ForeignKey,
     Integer,
     Numeric,
@@ -18,7 +17,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.db.connection import Base
+from app.db.connection import Base, pg_enum
 
 
 class CustomerSegment(str, enum.Enum):
@@ -59,7 +58,7 @@ class Customer(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     company: Mapped[str | None] = mapped_column(String(255))
-    segment: Mapped[CustomerSegment] = mapped_column(Enum(CustomerSegment), nullable=False)
+    segment: Mapped[CustomerSegment] = mapped_column(pg_enum(CustomerSegment), nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     last_order_date: Mapped[date | None] = mapped_column(Date)
@@ -89,7 +88,7 @@ class Order(Base):
     customer_id: Mapped[int] = mapped_column(ForeignKey("business.customers.id"), nullable=False)
     product_id: Mapped[int] = mapped_column(ForeignKey("business.products.id"), nullable=False)
     order_date: Mapped[date] = mapped_column(Date, nullable=False)
-    status: Mapped[OrderStatus] = mapped_column(Enum(OrderStatus), nullable=False)
+    status: Mapped[OrderStatus] = mapped_column(pg_enum(OrderStatus), nullable=False)
 
     # Ambiguous amount fields - this is intentional for the experiment
     total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)  # Full price before any adjustments
@@ -110,8 +109,8 @@ class Payment(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     order_id: Mapped[int] = mapped_column(ForeignKey("business.orders.id"), nullable=False)
     amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
-    method: Mapped[PaymentMethod] = mapped_column(Enum(PaymentMethod), nullable=False)
-    status: Mapped[PaymentStatus] = mapped_column(Enum(PaymentStatus), nullable=False)
+    method: Mapped[PaymentMethod] = mapped_column(pg_enum(PaymentMethod), nullable=False)
+    status: Mapped[PaymentStatus] = mapped_column(pg_enum(PaymentStatus), nullable=False)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
