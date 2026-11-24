@@ -166,6 +166,46 @@ class TestBuildSQL:
         sql = agent._build_sql("What is our average order value?", AOV)
         assert "AVG(net_amount)" in sql
 
+    def test_group_by_category(self, agent):
+        sql = agent._build_sql("What was revenue by product category in July 2026?", NET_REVENUE)
+        assert "JOIN business.products p ON p.id = o.product_id" in sql
+        assert "GROUP BY p.category" in sql
+        assert "order_date >= '2026-07-01'" in sql
+
+    def test_top_n_products(self, agent):
+        sql = agent._build_sql("What are our top 5 products by revenue?", NET_REVENUE)
+        assert "GROUP BY p.name" in sql
+        assert sql.endswith("ORDER BY net_revenue DESC LIMIT 5")
+
+    def test_segment_filter(self, agent):
+        sql = agent._build_sql("What was the revenue from enterprise customers in July 2026?", NET_REVENUE)
+        assert "JOIN business.customers c ON c.id = o.customer_id" in sql
+        assert "c.segment = 'enterprise'" in sql
+
+    def test_group_by_segment(self, agent):
+        sql = agent._build_sql("What customer segments generate the most revenue?", NET_REVENUE)
+        assert "GROUP BY c.segment" in sql
+
+    def test_segment_on_customers_table_needs_no_join(self, agent):
+        sql = agent._build_sql("How many active customers per segment?", ACTIVE_CUSTOMERS)
+        assert "JOIN" not in sql
+        assert "GROUP BY segment" in sql
+
+    def test_multi_month_comparison(self, agent):
+        sql = agent._build_sql("Compare revenue between June and July 2026", NET_REVENUE)
+        assert "order_date >= '2026-06-01'" in sql and "order_date >= '2026-07-01'" in sql
+        assert "GROUP BY TO_CHAR(order_date, 'YYYY-MM')" in sql
+        assert "ORDER BY month" in sql
+
+    def test_synonym_sales_is_revenue(self, agent):
+        assert agent._extract_topic("What were sales last month?") == "revenue"
+        sql = agent._build_sql("sales by category", NET_REVENUE)
+        assert "GROUP BY p.category" in sql
+
+    def test_total_amount_column_is_not_a_data_question(self, agent):
+        assert agent._needs_sql("What does the total_amount column in orders represent?") is False
+        assert agent._needs_sql("What was our total revenue?") is True
+
     def test_generated_sql_passes_validator(self, agent):
         from app.mcp.tools import validate_sql
         for q, d in [("revenue in July 2026", NET_REVENUE), ("how many active customers", ACTIVE_CUSTOMERS),
@@ -212,6 +252,11 @@ class TestMetricPicking:
         found = self._search("active_customer_count", "total_customer_count")
         assert agent._pick_best_metric("How many active customers do we have?", found) == "active_customer_count"
         assert agent._pick_best_metric("What is the total number of customers?", found) == "total_customer_count"
+
+    def test_rejects_unrelated_metric(self, agent):
+        """'cancelled orders' must not be answered with net revenue just because it was found."""
+        found = self._search("net_revenue", "active_customer_count")
+        assert agent._pick_best_metric("How many orders were cancelled?", found) is None
 
     def test_explicit_rate_metric(self, agent):
         found = self._search("gross_revenue")  # 'refund' search only finds gross_revenue's description
