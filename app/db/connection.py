@@ -15,6 +15,19 @@ class Base(DeclarativeBase):
     pass
 
 
+def _with_driver(url: str) -> str:
+    """Pin the psycopg2 driver for bare postgresql:// URLs.
+
+    SQLAlchemy 2.1 changed the default driver for postgresql:// from psycopg2 to
+    psycopg (v3). requirements.txt installs psycopg2-binary, so without this a fresh
+    install fails with "No module named 'psycopg'".
+    """
+    for prefix in ("postgresql://", "postgres://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg2://" + url[len(prefix):]
+    return url
+
+
 @lru_cache(maxsize=2)
 def get_engine(readonly: bool = False):
     """Get the (cached) SQLAlchemy engine. Use readonly=True for agent SQL execution.
@@ -26,13 +39,13 @@ def get_engine(readonly: bool = False):
     settings = get_settings()
     if readonly:
         return create_engine(
-            settings.database_url_readonly,
+            _with_driver(settings.database_url_readonly),
             echo=False,
             pool_pre_ping=True,
             # Server-side guard against runaway queries (e.g. huge cross joins).
             connect_args={"options": f"-c statement_timeout={READONLY_STATEMENT_TIMEOUT_MS}"},
         )
-    return create_engine(settings.database_url, echo=False, pool_pre_ping=True)
+    return create_engine(_with_driver(settings.database_url), echo=False, pool_pre_ping=True)
 
 
 @lru_cache(maxsize=2)
