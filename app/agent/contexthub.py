@@ -598,5 +598,6 @@ Rules:
             warning = ""
             if status in ("deprecated", "experimental", "stale"):
                 warning = f"\nWARNING: {metric} is {status}. {trust.get('reason', '')}"
-            return f"Result: {result}\n\nMetric: {metric} (status: {status})\nSource: {source}{warning}"
+            notes = f"\nNote: {definition['notes']}" if definition and definition.get("notes") else ""
+            return f"Result: {result}\n\nMetric: {metric} (status: {status})\nSource: {source}{warning}{notes}"
         return context_str

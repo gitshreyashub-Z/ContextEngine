@@ -267,6 +267,20 @@ def seed_trust_signals(session) -> None:
             last_validated=datetime(2026, 7, 1),
         ),
         TrustSignal(
+            asset_name="order_completion_rate",
+            trust_level=TrustLevel.CERTIFIED,
+            reason="Certified operations KPI: completed orders out of all non-pending orders.",
+            certified_by="Operations Team",
+            last_validated=datetime(2026, 7, 1),
+        ),
+        TrustSignal(
+            asset_name="refund_rate",
+            trust_level=TrustLevel.CERTIFIED,
+            reason="Certified: refunded orders out of fulfilled (completed + refunded) orders.",
+            certified_by="Finance Team",
+            last_validated=datetime(2026, 7, 1),
+        ),
+        TrustSignal(
             asset_name="orders",
             trust_level=TrustLevel.CERTIFIED,
             reason="Primary orders table. Contains multiple amount fields - always check business definitions before selecting a column.",
