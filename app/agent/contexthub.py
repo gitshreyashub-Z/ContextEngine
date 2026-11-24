@@ -1,50 +1,85 @@
 """ContextEngine agent - uses structured context to answer questions reliably.
 
-This agent forces a deterministic workflow:
+This agent runs a deterministic workflow (a fixed pipeline, not an LLM tool-calling loop):
 1. Search for relevant assets
-2. Get the definition of the best metric
-3. Check trust signal
-4. Execute SQL based on the definition
-5. Use LLM to format the final answer
+2. Pick the best metric (explicit mention first, then rank by trust signal)
+3. Get the metric's business definition
+4. Check its trust signal
+5. Build and execute SQL from the definition (only for data questions)
+6. Use the LLM once, to phrase the final answer from the collected context
 
-This approach doesn't rely on the LLM to decide tool ordering.
+The LLM does not decide tool ordering or write SQL here; the context layer does.
 """
 
 import json
 import logging
+import re
 import time
+from datetime import date, timedelta
 from typing import Any
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from app.agent.llm import get_llm
-from app.agent.prompts import CONTEXTENGINE_SYSTEM_PROMPT
 from app.mcp.tools import ContextTools
 
 logger = logging.getLogger(__name__)
 
 _tools = ContextTools()
 
+# Higher is more trustworthy. Used to rank candidate metrics.
+TRUST_RANK = {"certified": 3, "experimental": 2, "stale": 1, "deprecated": 0}
+
+# Metric statuses for which no SQL should be run (no valid calculation exists).
+NON_EXECUTABLE_STATUSES = {"draft"}
+
+# Common abbreviations / phrasings that refer to a specific metric.
+METRIC_ALIASES = {
+    "mrr": "monthly_recurring_revenue",
+    "recurring revenue": "monthly_recurring_revenue",
+    "aov": "average_order_value",
+    "completion rate": "order_completion_rate",
+}
+
+# Rate metrics: numerator condition, evaluated within the definition's filter_condition
+# (which acts as the denominator population).
+RATE_NUMERATORS = {
+    "refund_rate": "status = 'refunded'",
+    "order_completion_rate": "status = 'completed'",
+}
+
+# Which date column to use for time filters, per source table.
+DATE_COLUMNS = {
+    "business.orders": "order_date",
+    "business.payments": "paid_at",
+}
+
+MONTHS = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+
+def _month_range(year: int, month: int, column: str) -> str:
+    """Half-open date range covering one calendar month (handles December rollover)."""
+    start = date(year, month, 1)
+    end = date(year + 1, 1, 1) if month == 12 else date(year, month + 1, 1)
+    return f"{column} >= '{start.isoformat()}' AND {column} < '{end.isoformat()}'"
+
 
 class ContextEngineAgent:
     """Context-aware agent with deterministic tool workflow.
 
-    Forces: search → definition → trust → SQL → answer
+    Forces: search → pick metric → definition → trust → SQL → answer
     """
 
     def __init__(self):
         self.name = "contexthub"
 
     def ask(self, question: str) -> dict[str, Any]:
-        """Ask the ContextEngine agent a question.
-
-        Executes a deterministic workflow:
-        1. Search assets for the topic
-        2. Get metric definition
-        3. Check trust signal
-        4. Execute SQL if a calculation is needed
-        5. Format answer with LLM
-        """
+        """Ask the ContextEngine agent a question."""
         start_time = time.time()
         tool_calls_log = []
         sources = []
@@ -55,30 +90,47 @@ class ContextEngineAgent:
             search_result = _tools.search_assets(search_query)
             tool_calls_log.append({"tool": "search_assets", "args": {"query": search_query}, "result_preview": json.dumps(search_result, default=str)[:500]})
 
-            # Step 2: Find the best metric and get its definition
-            metric_name = self._pick_best_metric(search_result)
+            # Step 2: Pick the best metric (uses trust signals, not description text)
+            metric_name = self._pick_best_metric(question, search_result)
+
+            # Step 3: Get its definition
             definition = None
             if metric_name:
                 definition = _tools.get_definition(metric_name)
                 tool_calls_log.append({"tool": "get_definition", "args": {"metric_name": metric_name}, "result_preview": json.dumps(definition, default=str)[:500]})
+                if "error" in definition:
+                    definition = None
+                else:
+                    sources.append({
+                        "type": "definition",
+                        "metric": definition["metric_name"],
+                        "status": definition.get("status", "unknown"),
+                        "source": f"{definition.get('source_table')}.{definition.get('source_column')}",
+                    })
 
-            # Step 3: Check trust signal
+            # Step 4: Check trust signal
             trust = None
             if metric_name:
                 trust = _tools.get_trust_signal(metric_name)
                 tool_calls_log.append({"tool": "get_trust_signal", "args": {"asset_name": metric_name}, "result_preview": json.dumps(trust, default=str)[:500]})
-                if trust and "trust_level" in trust:
+                if "trust_level" in trust:
                     sources.append({"type": "trust_signal", "asset": metric_name, "level": trust["trust_level"]})
+                else:
+                    trust = None
 
-            # Step 4: Execute SQL if this is a data question
+            # Step 5: Execute SQL if this is a data question and the metric is computable
             sql_result = None
-            if definition and self._needs_sql(question):
+            if (
+                definition
+                and definition.get("status") not in NON_EXECUTABLE_STATUSES
+                and self._needs_sql(question)
+            ):
                 sql_query = self._build_sql(question, definition)
                 if sql_query:
                     sql_result = _tools.execute_sql(sql_query)
                     tool_calls_log.append({"tool": "execute_sql", "args": {"query": sql_query}, "result_preview": json.dumps(sql_result, default=str)[:500]})
 
-            # Step 5: Use LLM to format the final answer
+            # Step 6: Use LLM to format the final answer
             answer = self._format_answer(question, search_result, definition, trust, sql_result)
 
             elapsed = time.time() - start_time
@@ -110,8 +162,7 @@ class ContextEngineAgent:
             }
 
     def _extract_topic(self, question: str) -> str:
-        """Extract the search topic from the question."""
-        # Simple keyword extraction
+        """Extract the search topic from the question (simple keyword extraction)."""
         keywords = ["revenue", "customer", "order", "product", "payment", "active", "refund", "aov", "mrr"]
         q_lower = question.lower()
         for kw in keywords:
@@ -120,115 +171,153 @@ class ContextEngineAgent:
         # Fallback: use first few meaningful words
         return question.split("?")[0].strip()[:50]
 
-    def _pick_best_metric(self, search_result: dict) -> str | None:
-        """Pick the best (certified) metric from search results."""
-        results = search_result.get("results", [])
-        # Prefer metrics over tables
-        metrics = [r for r in results if r.get("type") == "metric"]
-        if not metrics:
+    def _find_explicit_metric(self, question: str) -> str | None:
+        """Return a metric the question names directly (e.g. 'gross revenue', 'MRR')."""
+        q_lower = question.lower()
+        for alias, metric in METRIC_ALIASES.items():
+            if re.search(rf"\b{re.escape(alias)}\b", q_lower):
+                return metric
+
+        metrics = _tools.list_metrics().get("metrics", [])
+        # Longest names first so 'order_completion_rate' wins over shorter overlaps
+        for m in sorted(metrics, key=lambda m: len(m["metric_name"]), reverse=True):
+            name = m["metric_name"]
+            if name in q_lower or name.replace("_", " ") in q_lower:
+                return name
+        return None
+
+    def _pick_best_metric(self, question: str, search_result: dict) -> str | None:
+        """Pick the metric to use.
+
+        1. If the question names a metric explicitly, use it (so we can warn if it is
+           deprecated/experimental instead of silently swapping it).
+        2. Otherwise rank the metric assets found by search: trust level first
+           (from the structured trust_signals table), then word overlap with the question.
+        """
+        explicit = self._find_explicit_metric(question)
+        if explicit:
+            return explicit
+
+        candidates = [r for r in search_result.get("results", []) if r.get("type") == "metric"]
+        if not candidates:
             return None
 
-        # Prefer non-deprecated
-        for m in metrics:
-            desc = m.get("description", "").lower()
-            if "deprecated" not in desc and "draft" not in desc:
-                return m["name"]
+        q_lower = question.lower()
 
-        # Return first metric if all are deprecated
-        return metrics[0]["name"]
+        def score(candidate: dict) -> tuple[int, int]:
+            trust = _tools.get_trust_signal(candidate["name"])
+            trust_rank = TRUST_RANK.get(trust.get("trust_level"), -1)
+            overlap = sum(1 for word in candidate["name"].split("_") if word in q_lower)
+            return trust_rank, overlap
+
+        return max(candidates, key=score)["name"]
 
     def _needs_sql(self, question: str) -> bool:
         """Determine if the question needs a SQL query (asks for data/numbers)."""
-        data_words = ["what was", "how many", "how much", "calculate", "total", "count", "average", "sum", "revenue in", "customers in", "orders in"]
+        data_words = ["what was", "what is our", "how many", "how much", "calculate", "total", "count",
+                      "average", "sum", "revenue in", "customers in", "orders in", "rate"]
         q_lower = question.lower()
         return any(w in q_lower for w in data_words)
 
-    def _build_sql(self, question: str, definition: dict) -> str | None:
+    def _build_sql(self, question: str, definition: dict, today: date | None = None) -> str | None:
         """Build SQL based on the metric definition and question context."""
         if not definition:
             return None
 
         source_table = definition.get("source_table", "")
         source_column = definition.get("source_column", "")
-        filter_condition = definition.get("filter_condition", "")
-        calculation = definition.get("calculation", "")
+        filter_condition = definition.get("filter_condition") or ""
+        calculation = definition.get("calculation") or ""
+        metric_name = definition.get("metric_name", "")
 
         if not source_table or not source_column:
             return None
 
-        # Determine date filter from question
-        date_filter = self._extract_date_filter(question)
+        conditions = [filter_condition] if filter_condition else []
 
-        # Build the query based on metric type
-        metric_name = definition.get("metric_name", "")
+        # Date filters only make sense for tables that have a date column
+        date_column = DATE_COLUMNS.get(source_table)
+        if date_column:
+            date_filter = self._extract_date_filter(question, column=date_column, today=today)
+            if date_filter:
+                conditions.append(date_filter)
 
-        if "count" in metric_name.lower() or "rate" in metric_name.lower():
-            # Count-based metric
+        where = f" WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        if metric_name in RATE_NUMERATORS:
+            numerator = RATE_NUMERATORS[metric_name]
+            return (
+                f"SELECT ROUND(100.0 * COUNT(*) FILTER (WHERE {numerator}) / NULLIF(COUNT(*), 0), 2) "
+                f"AS {metric_name}_pct FROM {source_table}{where}"
+            )
+        if "count" in metric_name.lower():
             if filter_condition:
-                sql = f"SELECT COUNT(DISTINCT {source_column}) FROM {source_table} WHERE {filter_condition}"
-            else:
-                sql = f"SELECT COUNT(*) FROM {source_table}"
-        elif "average" in metric_name.lower() or "avg" in calculation.lower():
-            sql = f"SELECT AVG({source_column}) FROM {source_table}"
-            if filter_condition:
-                sql += f" WHERE {filter_condition}"
-        else:
-            # Sum-based metric (revenue, etc.)
-            sql = f"SELECT SUM({source_column}) FROM {source_table}"
-            if filter_condition:
-                sql += f" WHERE {filter_condition}"
+                return f"SELECT COUNT(DISTINCT {source_column}) AS {metric_name} FROM {source_table}{where}"
+            return f"SELECT COUNT(*) AS {metric_name} FROM {source_table}{where}"
+        if "average" in metric_name.lower() or "avg" in calculation.lower():
+            return f"SELECT ROUND(AVG({source_column}), 2) AS {metric_name} FROM {source_table}{where}"
+        # Sum-based metric (revenue, etc.)
+        return f"SELECT SUM({source_column}) AS {metric_name} FROM {source_table}{where}"
 
-        # Add date filter
-        if date_filter:
-            if "WHERE" in sql:
-                sql += f" AND {date_filter}"
-            else:
-                sql += f" WHERE {date_filter}"
+    def _extract_date_filter(self, question: str, column: str = "order_date", today: date | None = None) -> str:
+        """Extract a date filter from question text.
 
-        return sql
-
-    def _extract_date_filter(self, question: str) -> str:
-        """Extract date filter from question text."""
-        import re
+        Supports: 'last month' / 'previous month', 'this month', '<month> <year>',
+        'in <month>' (most recent such month), 'in <year>'.
+        """
+        today = today or date.today()
         q_lower = question.lower()
 
-        # Match "July 2026", "jan 2025", etc.
-        months = {"january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
-                  "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
-                  "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+        if "last month" in q_lower or "previous month" in q_lower:
+            last_month = today.replace(day=1) - timedelta(days=1)
+            return _month_range(last_month.year, last_month.month, column)
 
-        for month_name, month_num in months.items():
-            pattern = rf"{month_name}\s+(\d{{4}})"
-            match = re.search(pattern, q_lower)
+        if "this month" in q_lower:
+            return _month_range(today.year, today.month, column)
+
+        # "<month> <year>", e.g. "July 2026"
+        for month_name, month_num in MONTHS.items():
+            match = re.search(rf"\b{month_name}\b\s+(\d{{4}})\b", q_lower)
             if match:
-                year = match.group(1)
-                return f"order_date >= '{year}-{month_num:02d}-01' AND order_date < '{year}-{month_num + 1 if month_num < 12 else 1:02d}-01'"
+                return _month_range(int(match.group(1)), month_num, column)
 
-        # Match just year
-        year_match = re.search(r"in (\d{4})", q_lower)
+        # "in <month>" without a year → most recent occurrence of that month
+        for month_name, month_num in MONTHS.items():
+            if re.search(rf"\bin {month_name}\b", q_lower):
+                year = today.year if month_num <= today.month else today.year - 1
+                return _month_range(year, month_num, column)
+
+        # "in <year>"
+        year_match = re.search(r"\bin (\d{4})\b", q_lower)
         if year_match:
-            year = year_match.group(1)
-            return f"order_date >= '{year}-01-01' AND order_date < '{int(year)+1}-01-01'"
+            year = int(year_match.group(1))
+            return f"{column} >= '{year}-01-01' AND {column} < '{year + 1}-01-01'"
 
         return ""
 
     def _format_answer(self, question: str, search_result: dict, definition: dict | None, trust: dict | None, sql_result: dict | None) -> str:
         """Use LLM to format a clean final answer from all collected context."""
-        # Build context for the LLM
         context_parts = []
 
         if definition:
             context_parts.append(f"Metric: {definition.get('metric_name')} ({definition.get('status', 'unknown')})")
             context_parts.append(f"Definition: {definition.get('definition', '')}")
             context_parts.append(f"Source: {definition.get('source_table')}.{definition.get('source_column')}")
+            if definition.get("filter_condition"):
+                context_parts.append(f"Filter: {definition['filter_condition']}")
+            if definition.get("notes"):
+                context_parts.append(f"Notes: {definition['notes']}")
 
         if trust:
             context_parts.append(f"Trust Level: {trust.get('trust_level', 'unknown')}")
-            context_parts.append(f"Certified by: {trust.get('certified_by', 'N/A')}")
+            context_parts.append(f"Trust Reason: {trust.get('reason', '')}")
+            context_parts.append(f"Certified by: {trust.get('certified_by') or 'N/A'}")
 
         if sql_result and "rows" in sql_result:
             context_parts.append(f"SQL Result: {json.dumps(sql_result['rows'], default=str)}")
             context_parts.append(f"Query: {sql_result.get('query', '')}")
+        elif sql_result and "error" in sql_result:
+            context_parts.append(f"SQL Error: {sql_result['error']}")
 
         if not context_parts:
             # No metric found - list what was found
@@ -236,12 +325,10 @@ class ContextEngineAgent:
             if assets:
                 context_parts.append("Available assets found:")
                 for a in assets[:5]:
-                    status = "DEPRECATED" if "deprecated" in a.get("description", "").lower() else "certified" if "certified" in a.get("description", "").lower() else ""
-                    context_parts.append(f"  - {a['name']} ({a['type']}) {status}: {a.get('description', '')[:100]}")
+                    context_parts.append(f"  - {a['name']} ({a['type']}): {a.get('description', '')[:100]}")
 
         context_str = "\n".join(context_parts)
 
-        # Use LLM to produce a clean answer
         llm = get_llm(temperature=0.0)
         prompt = f"""Based on this context, provide a SHORT and clear answer to the user's question.
 
@@ -253,7 +340,8 @@ Context:
 Rules:
 - If SQL result has a number, state it clearly (format large numbers with commas)
 - Mention the metric used and its certification status
-- If a metric is deprecated, warn the user
+- If a metric is deprecated, experimental, stale or draft, warn the user
+- Only use information from the context; if the context does not answer the question, say so
 - Keep answer to 3-5 sentences maximum
 - Do NOT use tool calls or JSON in your response"""
 
@@ -263,11 +351,15 @@ Rules:
                 HumanMessage(content=prompt),
             ])
             return response.content if isinstance(response.content, str) else str(response.content)
-        except Exception as e:
+        except Exception:
             # Fallback: format without LLM
-            if sql_result and "rows" in sql_result and sql_result["rows"]:
+            if sql_result and sql_result.get("rows"):
                 value = list(sql_result["rows"][0].values())[0]
+                value_str = f"{value:,.2f}" if isinstance(value, (int, float)) or hasattr(value, "as_tuple") else str(value)
                 metric = definition.get("metric_name", "unknown") if definition else "unknown"
                 status = trust.get("trust_level", "unknown") if trust else "unknown"
-                return f"Result: {value:,.2f}\n\nMetric: {metric} (status: {status})\nSource: {definition.get('source_table', '')}.{definition.get('source_column', '')}"
+                source = f"{definition.get('source_table', '')}.{definition.get('source_column', '')}" if definition else ""
+                if value is None:
+                    value_str = "no matching data"
+                return f"Result: {value_str}\n\nMetric: {metric} (status: {status})\nSource: {source}"
             return f"Context found but could not generate answer: {context_str[:200]}"

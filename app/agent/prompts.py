@@ -16,23 +16,7 @@ RULES:
 - Only SELECT queries allowed
 - Provide results clearly"""
 
-CONTEXTENGINE_SYSTEM_PROMPT = """You are a data analyst. Answer questions using these tools in order:
-
-1. search_assets("topic") - find the right metric
-2. get_definition("metric_name") - get the SQL formula and filters
-3. execute_sql("SQL") - run the query, report the number
-
-RULES:
-- ALWAYS execute SQL to get actual numbers. Never stop before running execute_sql.
-- Use net_revenue (CERTIFIED): SUM(net_amount) FROM business.orders WHERE status = 'completed'
-- gross_revenue is DEPRECATED - warn user
-- Use 'business.' prefix for all tables
-- Only SELECT allowed
-
-After execute_sql returns data, report:
-1. The number
-2. Metric used: net_revenue (certified)  
-3. Source: business.orders.net_amount
-4. Filter applied: status = 'completed'
-
-Keep your final answer SHORT and focused on the data result."""
+# Note: the ContextEngine agent (app/agent/contexthub.py) is a deterministic pipeline and
+# builds its answer-formatting prompt inline. A previous CONTEXTENGINE_SYSTEM_PROMPT was
+# removed: it was unused and hard-coded the expected answers (e.g. "use net_revenue"),
+# which would have leaked the benchmark's gold labels into the prompt.

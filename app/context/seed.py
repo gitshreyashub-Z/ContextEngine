@@ -82,7 +82,7 @@ def seed_assets(session) -> None:
             column_name="is_active",
         ),
         Asset(
-            name="customer_count",
+            name="total_customer_count",
             asset_type=AssetType.METRIC,
             description="Total count of all registered customers regardless of activity status.",
             owner="Customer Success Team",

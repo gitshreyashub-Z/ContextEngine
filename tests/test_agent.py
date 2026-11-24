@@ -6,9 +6,12 @@ Full integration tests require an LLM API key.
 Run with: pytest tests/test_agent.py -v
 """
 
+from datetime import date
+from unittest.mock import patch
+
 import pytest
 
-from app.agent.prompts import BASELINE_SYSTEM_PROMPT, CONTEXTENGINE_SYSTEM_PROMPT
+from app.agent.prompts import BASELINE_SYSTEM_PROMPT
 
 
 class TestPrompts:
@@ -27,24 +30,14 @@ class TestPrompts:
         assert "trust signal" not in BASELINE_SYSTEM_PROMPT.lower()
         assert "business definition" not in BASELINE_SYSTEM_PROMPT.lower()
 
-    def test_contexthub_prompt_instructs_context_usage(self):
-        """ContextEngine prompt should instruct agent to use context tools first."""
-        assert "search_assets" in CONTEXTENGINE_SYSTEM_PROMPT
-        assert "get_definition" in CONTEXTENGINE_SYSTEM_PROMPT
-        assert "get_trust_signal" in CONTEXTENGINE_SYSTEM_PROMPT
-        assert "certified" in CONTEXTENGINE_SYSTEM_PROMPT.lower()
-        assert "deprecated" in CONTEXTENGINE_SYSTEM_PROMPT.lower()
+    def test_baseline_prompt_restricts_to_select(self):
+        """Baseline prompt should mention the SELECT-only restriction."""
+        assert "SELECT" in BASELINE_SYSTEM_PROMPT
 
-    def test_contexthub_prompt_enforces_workflow(self):
-        """ContextEngine prompt should enforce context-first workflow."""
-        # Should mention checking definitions BEFORE writing SQL
-        assert "BEFORE" in CONTEXTENGINE_SYSTEM_PROMPT or "before" in CONTEXTENGINE_SYSTEM_PROMPT
-        assert "MUST" in CONTEXTENGINE_SYSTEM_PROMPT
-
-    def test_both_prompts_restrict_to_select(self):
-        """Both prompts should mention read-only/SELECT restriction."""
-        assert "SELECT" in BASELINE_SYSTEM_PROMPT or "read-only" in BASELINE_SYSTEM_PROMPT.lower()
-        assert "SELECT" in CONTEXTENGINE_SYSTEM_PROMPT or "read-only" in CONTEXTENGINE_SYSTEM_PROMPT.lower()
+    def test_baseline_prompt_does_not_leak_answers(self):
+        """The control group must not be told which column is revenue."""
+        assert "net_revenue" not in BASELINE_SYSTEM_PROMPT
+        assert "90 days" not in BASELINE_SYSTEM_PROMPT
 
 
 class TestAgentInterface:
@@ -71,18 +64,158 @@ class TestAgentInterface:
         assert "execute_sql" in tool_names
         assert len(tool_names) == 1  # Only SQL execution
 
-    def test_contexthub_has_all_tools(self):
-        """ContextEngine agent should have all 7 tools."""
-        from app.agent.contexthub import CONTEXTHUB_TOOLS
-        tool_names = [t.name for t in CONTEXTHUB_TOOLS]
-        assert "search_assets" in tool_names
-        assert "get_definition" in tool_names
-        assert "get_trust_signal" in tool_names
-        assert "get_schema" in tool_names
-        assert "get_lineage" in tool_names
-        assert "execute_sql" in tool_names
-        assert "list_metrics" in tool_names
-        assert len(tool_names) == 7
+
+
+NET_REVENUE = {
+    "metric_name": "net_revenue", "source_table": "business.orders", "source_column": "net_amount",
+    "filter_condition": "status = 'completed'", "calculation": "SUM(orders.net_amount) WHERE orders.status = 'completed'",
+    "status": "certified",
+}
+ACTIVE_CUSTOMERS = {
+    "metric_name": "active_customer_count", "source_table": "business.customers", "source_column": "id",
+    "filter_condition": "is_active = true AND last_order_date >= CURRENT_DATE - INTERVAL '90 days'",
+    "calculation": "COUNT(DISTINCT customers.id) ...", "status": "certified",
+}
+REFUND_RATE = {
+    "metric_name": "refund_rate", "source_table": "business.orders", "source_column": "status",
+    "filter_condition": "status IN ('completed', 'refunded')", "calculation": "COUNT(...) / COUNT(...) * 100",
+    "status": "certified",
+}
+AOV = {
+    "metric_name": "average_order_value", "source_table": "business.orders", "source_column": "net_amount",
+    "filter_condition": "status = 'completed'", "calculation": "AVG(orders.net_amount) WHERE ...",
+    "status": "certified",
+}
+
+
+class TestDateFilter:
+    """ContextEngine date parsing (pure logic, no DB/LLM needed)."""
+
+    @pytest.fixture
+    def agent(self):
+        from app.agent.contexthub import ContextEngineAgent
+        return ContextEngineAgent()
+
+    def test_month_and_year(self, agent):
+        f = agent._extract_date_filter("What was our total revenue in July 2026?")
+        assert f == "order_date >= '2026-07-01' AND order_date < '2026-08-01'"
+
+    def test_december_rolls_over_year(self, agent):
+        f = agent._extract_date_filter("Revenue in December 2025")
+        assert f == "order_date >= '2025-12-01' AND order_date < '2026-01-01'"
+
+    def test_last_month(self, agent):
+        f = agent._extract_date_filter("What was our revenue last month?", today=date(2026, 8, 10))
+        assert f == "order_date >= '2026-07-01' AND order_date < '2026-08-01'"
+
+    def test_last_month_in_january(self, agent):
+        f = agent._extract_date_filter("revenue last month", today=date(2026, 1, 15))
+        assert f == "order_date >= '2025-12-01' AND order_date < '2026-01-01'"
+
+    def test_month_without_year_uses_most_recent(self, agent):
+        f = agent._extract_date_filter("revenue from enterprise customers in July", today=date(2026, 8, 10))
+        assert f.startswith("order_date >= '2026-07-01'")
+        f = agent._extract_date_filter("revenue in September", today=date(2026, 8, 10))
+        assert f.startswith("order_date >= '2025-09-01'")
+
+    def test_year_only(self, agent):
+        f = agent._extract_date_filter("How many orders in 2025?")
+        assert f == "order_date >= '2025-01-01' AND order_date < '2026-01-01'"
+
+    def test_may_as_verb_is_not_a_month(self, agent):
+        assert agent._extract_date_filter("May I see the revenue?") == ""
+
+    def test_custom_date_column(self, agent):
+        f = agent._extract_date_filter("in 2025", column="paid_at")
+        assert f.startswith("paid_at >= '2025-01-01'")
+
+
+class TestBuildSQL:
+    """ContextEngine SQL generation from definitions."""
+
+    @pytest.fixture
+    def agent(self):
+        from app.agent.contexthub import ContextEngineAgent
+        return ContextEngineAgent()
+
+    def test_sum_metric_with_date(self, agent):
+        sql = agent._build_sql("What was our total revenue in July 2026?", NET_REVENUE)
+        assert sql.startswith("SELECT SUM(net_amount)")
+        assert "status = 'completed'" in sql
+        assert "order_date >= '2026-07-01'" in sql
+
+    def test_count_metric(self, agent):
+        sql = agent._build_sql("How many active customers do we have?", ACTIVE_CUSTOMERS)
+        assert "COUNT(DISTINCT id)" in sql
+        assert "INTERVAL '90 days'" in sql
+
+    def test_no_order_date_filter_on_customers_table(self, agent):
+        """customers has no order_date column; a date filter would make the SQL fail."""
+        sql = agent._build_sql("How many active customers in 2025?", ACTIVE_CUSTOMERS)
+        assert "2025" not in sql
+        assert " order_date" not in sql  # last_order_date (from the definition) is fine
+
+    def test_rate_metric_is_a_percentage(self, agent):
+        """Previously produced COUNT(DISTINCT status), which always returned 2."""
+        sql = agent._build_sql("What is our refund rate?", REFUND_RATE)
+        assert "COUNT(DISTINCT" not in sql
+        assert "FILTER (WHERE status = 'refunded')" in sql
+        assert "100.0" in sql
+
+    def test_average_metric(self, agent):
+        sql = agent._build_sql("What is our average order value?", AOV)
+        assert "AVG(net_amount)" in sql
+
+    def test_generated_sql_passes_validator(self, agent):
+        from app.mcp.tools import validate_sql
+        for q, d in [("revenue in July 2026", NET_REVENUE), ("how many active customers", ACTIVE_CUSTOMERS),
+                     ("refund rate", REFUND_RATE), ("average order value", AOV)]:
+            assert validate_sql(agent._build_sql(q, d))[0] is True
+
+
+class TestMetricPicking:
+    """Metric selection uses explicit mentions and trust signals (DB calls mocked)."""
+
+    METRICS = [{"metric_name": n} for n in [
+        "net_revenue", "gross_revenue", "recognized_revenue", "active_customer_count",
+        "total_customer_count", "average_order_value", "order_completion_rate", "refund_rate",
+        "monthly_recurring_revenue",
+    ]]
+    TRUST = {"net_revenue": "certified", "gross_revenue": "deprecated", "recognized_revenue": "experimental",
+             "active_customer_count": "certified", "total_customer_count": "certified"}
+
+    @pytest.fixture
+    def agent(self):
+        from app.agent import contexthub
+        with patch.object(contexthub._tools, "list_metrics", return_value={"metrics": self.METRICS}), \
+             patch.object(contexthub._tools, "get_trust_signal",
+                          side_effect=lambda n: {"trust_level": self.TRUST[n]} if n in self.TRUST else {"error": "x"}):
+            yield contexthub.ContextEngineAgent()
+
+    @staticmethod
+    def _search(*names):
+        return {"results": [{"name": n, "type": "metric", "description": ""} for n in names]}
+
+    def test_prefers_certified_over_deprecated(self, agent):
+        # Deprecated listed first: must not be picked just because of ordering
+        found = self._search("gross_revenue", "recognized_revenue", "net_revenue")
+        assert agent._pick_best_metric("What was our revenue last month?", found) == "net_revenue"
+
+    def test_explicit_mention_wins(self, agent):
+        found = self._search("net_revenue", "gross_revenue")
+        assert agent._pick_best_metric("What is our gross revenue?", found) == "gross_revenue"
+
+    def test_alias(self, agent):
+        assert agent._pick_best_metric("Can I use MRR for reporting?", self._search()) == "monthly_recurring_revenue"
+
+    def test_word_overlap_breaks_ties(self, agent):
+        found = self._search("active_customer_count", "total_customer_count")
+        assert agent._pick_best_metric("How many active customers do we have?", found) == "active_customer_count"
+        assert agent._pick_best_metric("What is the total number of customers?", found) == "total_customer_count"
+
+    def test_explicit_rate_metric(self, agent):
+        found = self._search("gross_revenue")  # 'refund' search only finds gross_revenue's description
+        assert agent._pick_best_metric("What is our refund rate?", found) == "refund_rate"
 
 
 class TestEvaluationScoring:
