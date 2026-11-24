@@ -149,7 +149,10 @@ def create_orders(session, customers: list[Customer], products: list[Product]) -
     status_weights = [0.05, 0.15, 0.60, 0.15, 0.05]  # pending, confirmed, completed, cancelled, refunded
 
     start_date = date(2024, 1, 1)
-    end_date = date(2026, 8, 15)
+    # Orders run up to the seed date so relative questions ("last month", the 90-day
+    # active-customer rule) always have data; never earlier than Aug 2026 so the
+    # July 2026 demo questions stay in range.
+    end_date = max(date.today(), date(2026, 8, 15))
     date_range = (end_date - start_date).days
 
     for i in range(5000):
